@@ -1,0 +1,156 @@
+name: Node.js Release
+
+on:
+  repository_dispatch:
+    types: [core-release]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. v1.2.0)'
+        required: true
+        type: string
+
+jobs:
+  set-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      semver: ${{ steps.ver.outputs.semver }}
+    steps:
+      - id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            TAG="${{ github.event.client_payload.version }}"
+          else
+            TAG="${{ inputs.version }}"
+          fi
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
+          echo "semver=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build .node binary (${{ matrix.settings.host }})
+    needs: set-version
+    runs-on: ${{ matrix.settings.host }}
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact-name: minigraf-linux-x64-gnu
+            rust_targets: x86_64-unknown-linux-gnu
+          - host: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact-name: minigraf-linux-arm64-gnu
+            rust_targets: aarch64-unknown-linux-gnu
+          - host: macos-14
+            target: universal-apple-darwin
+            artifact-name: minigraf-darwin-universal
+            rust_targets: aarch64-apple-darwin x86_64-apple-darwin
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact-name: minigraf-win32-x64-msvc
+            rust_targets: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.settings.rust_targets }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install npm dependencies
+        run: npm install
+
+      - name: Build native addon
+        shell: bash
+        run: |
+          if [ "${{ matrix.settings.target }}" = "universal-apple-darwin" ]; then
+            npx napi build --platform --release --target aarch64-apple-darwin
+            npx napi build --platform --release --target x86_64-apple-darwin
+            lipo -create -output minigraf.darwin-universal.node \
+              minigraf.darwin-arm64.node minigraf.darwin-x64.node
+            rm minigraf.darwin-arm64.node minigraf.darwin-x64.node
+          else
+            npx napi build --platform --release --target "${{ matrix.settings.target }}"
+          fi
+
+      - name: Upload .node binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.settings.artifact-name }}
+          path: "*.node"
+
+  publish:
+    name: Publish to npm
+    needs: [set-version, build]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Stamp version into package.json
+        run: |
+          VERSION="${{ needs.set-version.outputs.semver }}"
+          node -e "
+            const fs = require('fs');
+            const p = 'package.json';
+            const pkg = JSON.parse(fs.readFileSync(p, 'utf8'));
+            pkg.version = '${VERSION}';
+            fs.writeFileSync(p, JSON.stringify(pkg, null, 2) + '\n');
+          "
+
+      - name: Install npm dependencies
+        run: npm install
+
+      - name: Download all binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: minigraf-*
+          path: .
+          merge-multiple: true
+
+      - name: Distribute .node binaries to platform packages
+        run: |
+          cp minigraf.linux-x64-gnu.node   packages/@minigraf/linux-x64-gnu/
+          cp minigraf.linux-arm64-gnu.node packages/@minigraf/linux-arm64-gnu/
+          cp minigraf.darwin-universal.node packages/@minigraf/darwin-universal/
+          cp minigraf.win32-x64-msvc.node  packages/@minigraf/win32-x64-msvc/
+
+      - name: Sync platform package versions
+        run: |
+          VERSION="${{ needs.set-version.outputs.semver }}"
+          for dir in packages/@minigraf/*/; do
+            node -e "
+              const fs = require('fs');
+              const pkg = JSON.parse(fs.readFileSync('${dir}package.json', 'utf8'));
+              pkg.version = '${VERSION}';
+              fs.writeFileSync('${dir}package.json', JSON.stringify(pkg, null, 2) + '\n');
+            "
+          done
+
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for dir in packages/@minigraf/*/; do
+            npm publish "$dir" --access public || echo "Skipping $dir (already published or error)"
+          done
+
+      - name: Publish main minigraf package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
