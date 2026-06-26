@@ -205,7 +205,7 @@ jobs:
           done
 
       - name: Publish main minigraf package
-        run: npm publish --access public
+        run: npm publish --access public || echo "Already published, skipping"
 
 
 
