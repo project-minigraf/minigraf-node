@@ -70,7 +70,8 @@ jobs:
           else
             echo "Tag ${{ steps.ver.outputs.tag }} already exists, skipping"
           fi
-          git push origin main --follow-tags
+          git push origin main
+          git push origin "${{ steps.ver.outputs.tag }}" || true
 
   build:
     name: Build .node binary (${{ matrix.settings.host }})
