@@ -11,25 +11,57 @@ on:
         type: string
 
 jobs:
-  set-version:
+  prepare:
+    name: Pin version, commit, tag
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
       semver: ${{ steps.ver.outputs.semver }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.MINIGRAF_RELEASE_TOKEN }}
+
       - id: ver
         run: |
-          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            TAG="${{ github.event.client_payload.version }}"
-          else
-            TAG="${{ inputs.version }}"
-          fi
-          echo "version=$TAG" >> "$GITHUB_OUTPUT"
-          echo "semver=${TAG#v}" >> "$GITHUB_OUTPUT"
+          V="${{ github.event.client_payload.version || github.event.inputs.version }}"
+          echo "tag=$V" >> "$GITHUB_OUTPUT"
+          echo "semver=${V#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Wait for minigraf ${{ steps.ver.outputs.semver }} on crates.io
+        run: |
+          for i in $(seq 1 10); do
+            if cargo search minigraf --limit 1 | grep -q '"${{ steps.ver.outputs.semver }}"'; then
+              echo "Found minigraf ${{ steps.ver.outputs.semver }} on crates.io"
+              exit 0
+            fi
+            echo "Attempt $i/10 — not yet indexed, waiting 15s..."
+            sleep 15
+          done
+          echo "minigraf ${{ steps.ver.outputs.semver }} not found on crates.io after 150s" >&2
+          exit 1
+
+      - name: Pin minigraf version in Cargo.toml
+        run: |
+          sed -i 's/^minigraf = "[^"]*"/minigraf = "=${{ steps.ver.outputs.semver }}"/' Cargo.toml
+
+      - name: Update Cargo.lock
+        run: cargo update --precise "${{ steps.ver.outputs.semver }}" minigraf
+
+      - name: Commit and push tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore: release ${{ steps.ver.outputs.tag }}"
+          git tag "${{ steps.ver.outputs.tag }}"
+          git push origin main --follow-tags
 
   build:
     name: Build .node binary (${{ matrix.settings.host }})
-    needs: set-version
+    needs: prepare
     runs-on: ${{ matrix.settings.host }}
     strategy:
       fail-fast: false
@@ -54,6 +86,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -90,7 +124,7 @@ jobs:
 
   publish:
     name: Publish to npm
-    needs: [set-version, build]
+    needs: [prepare, build]
     runs-on: ubuntu-latest
     environment:
       name: npm
@@ -101,6 +135,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
@@ -110,7 +146,7 @@ jobs:
 
       - name: Stamp version into package.json
         run: |
-          VERSION="${{ needs.set-version.outputs.semver }}"
+          VERSION="${{ needs.prepare.outputs.semver }}"
           node -e "
             const fs = require('fs');
             const p = 'package.json';
@@ -138,7 +174,7 @@ jobs:
 
       - name: Sync platform package versions
         run: |
-          VERSION="${{ needs.set-version.outputs.semver }}"
+          VERSION="${{ needs.prepare.outputs.semver }}"
           for dir in packages/@minigraf/*/; do
             node -e "
               const fs = require('fs');
@@ -156,4 +192,5 @@ jobs:
 
       - name: Publish main minigraf package
         run: npm publish --access public
+
 
