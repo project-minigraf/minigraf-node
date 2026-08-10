@@ -34,7 +34,32 @@ console.log(result.results[0][0])  // "Alice"
 const db2 = new MiniGrafDb('path/to/mydb.graph')
 db2.execute('(transact [[:bob :name "Bob"]])')
 db2.checkpoint()
+db2.close()
 ```
+
+## Closing a file-backed database
+
+Only one handle per `.graph` file may be open in a process at a time — two
+would each cache their own page table and corrupt the file — so call `close()`
+when you are done with one:
+
+```js
+const db = new MiniGrafDb('mydb.graph')
+db.execute('(transact [[:bob :name "Bob"]])')
+db.checkpoint()
+db.close()
+
+const again = new MiniGrafDb('mydb.graph') // fine: the first handle is gone
+```
+
+Letting the variable go out of scope is **not** enough. JavaScript has no
+deterministic destructor: the object becomes unreachable, but the underlying
+handle survives until V8 garbage-collects it, which may be arbitrarily later or
+not at all before the process exits. Reopening before then throws
+`Database is already open in this process`.
+
+`close()` is idempotent; every other method throws once it has run. In-memory
+databases hold no file lock, so closing them is optional.
 
 ## Building from source
 
