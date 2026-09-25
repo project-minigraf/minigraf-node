@@ -73,9 +73,19 @@ jobs:
           git push origin main
           git push origin "${{ steps.ver.outputs.tag }}" || true
 
+  # Gate every build/publish job on this binding's test suite, run against the
+  # exact pinned core version that prepare just tagged. ci.yml also runs on the
+  # version-pin push to main, but nothing waits on that run.
+  test:
+    name: Test pinned release
+    needs: prepare
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.prepare.outputs.tag }}
+
   build:
     name: Build .node binary (${{ matrix.settings.host }})
-    needs: prepare
+    needs: [prepare, test]
     runs-on: ${{ matrix.settings.host }}
     strategy:
       fail-fast: false
@@ -138,7 +148,7 @@ jobs:
 
   publish:
     name: Publish to npm
-    needs: [prepare, build]
+    needs: [prepare, build, test]
     runs-on: ubuntu-latest
     environment:
       name: npm
@@ -198,14 +208,26 @@ jobs:
             "
           done
 
-      - name: Publish platform packages
+      # Re-runs are expected (e.g. after a partial failure), so a version that is
+      # already on npm is skipped, not treated as an error. Any other npm failure
+      # fails the job. The job summary says which packages were actually published.
+      - name: Publish packages
+        env:
+          VERSION: ${{ needs.prepare.outputs.semver }}
         run: |
+          echo "## npm publish — $VERSION" >> "$GITHUB_STEP_SUMMARY"
+          publish() {
+            local dir="$1" name
+            name=$(node -p "require('./$dir/package.json').name")
+            if [ "$(npm view "$name@$VERSION" version 2>/dev/null)" = "$VERSION" ]; then
+              echo "::warning::$name@$VERSION is already on npm; skipping"
+              echo "- \`$name@$VERSION\` — already published, skipped" >> "$GITHUB_STEP_SUMMARY"
+            else
+              npm publish "$dir" --access public
+              echo "- \`$name@$VERSION\` — published" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          }
           for dir in packages/@minigraf/*/; do
-            npm publish "$dir" --access public || echo "Skipping $dir (already published or error)"
+            publish "${dir%/}"
           done
-
-      - name: Publish main minigraf package
-        run: npm publish --access public || echo "Already published, skipping"
-
-
-
+          publish .
