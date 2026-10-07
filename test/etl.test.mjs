@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { MiniGrafDb, LogWriter, VALID_TIME_FOREVER } from '../minigraf.js'
+import { MiniGrafDb, LogWriter, VALID_TIME_FOREVER, WAL_CHECKPOINT_NEVER } from '../minigraf.js'
 
 const QUERY = '(query [:find ?e ?n :where [?e :n ?n]])'
 const REF = '00000000-0000-4000-8000-000000000001'
@@ -168,4 +168,19 @@ test('log writer errors and close without finish', (t) => {
   assert.equal(fs.existsSync(abandoned), false)
   assert.equal(fs.existsSync(abandoned + '.partial'), false)
   src.close()
+})
+
+test('WAL_CHECKPOINT_NEVER keeps the WAL on close (#322)', (t) => {
+  const p = tmpDir(t)
+  const never = p('never.graph')
+  const db = MiniGrafDb.openWithOptions(never, { walCheckpointThreshold: WAL_CHECKPOINT_NEVER })
+  db.execute('(transact [[:a :n 1]])')
+  db.close()
+  assert.equal(fs.existsSync(never + '.wal'), true)
+
+  const ordinary = p('ordinary.graph')
+  const db2 = MiniGrafDb.openWithOptions(ordinary, { walCheckpointThreshold: WAL_CHECKPOINT_NEVER - 1 })
+  db2.execute('(transact [[:a :n 1]])')
+  db2.close()
+  assert.equal(fs.existsSync(ordinary + '.wal'), false)
 })

@@ -84,6 +84,10 @@ fn rows_to_json(rows: &[Vec<Value>]) -> String {
 
 // ─── Options, values and fact records ────────────────────────────────────────
 
+/// `walCheckpointThreshold` from which a handle never checkpoints:
+/// `Number.MAX_SAFE_INTEGER`, the largest integer a JS number holds exactly.
+const WAL_CHECKPOINT_NEVER: i64 = (1 << 53) - 1;
+
 /// Options for `MiniGrafDb.openWithOptions` and `LogWriter.create`. Every field
 /// is optional; an absent field keeps the Rust default.
 #[napi(object)]
@@ -96,6 +100,8 @@ pub struct OpenOptions {
     /// Open even when the filesystem cannot lock files. Default false.
     pub allow_unlocked: Option<bool>,
     /// WAL entries before an automatic checkpoint. Default 1000.
+    /// `WAL_CHECKPOINT_NEVER` (2^53 - 1, `Number.MAX_SAFE_INTEGER`) or more
+    /// means never: no automatic checkpoint and none when the handle closes.
     pub wal_checkpoint_threshold: Option<i64>,
     /// Facts a recursive rule may derive per iteration. Default 1,000,000.
     pub max_derived_facts: Option<i64>,
@@ -119,7 +125,14 @@ impl OpenOptions {
             o = o.allow_unlocked(v);
         }
         if let Some(v) = self.wal_checkpoint_threshold {
-            o = o.wal_checkpoint_threshold(to_usize(v, "walCheckpointThreshold")?);
+            // JS numbers cannot hold core's usize::MAX sentinel, so anything
+            // from Number.MAX_SAFE_INTEGER up stands for it.
+            let n = if v >= WAL_CHECKPOINT_NEVER {
+                usize::MAX
+            } else {
+                to_usize(v, "walCheckpointThreshold")?
+            };
+            o = o.wal_checkpoint_threshold(n);
         }
         if let Some(v) = self.max_derived_facts {
             o = o.max_derived_facts(to_usize(v, "maxDerivedFacts")?);
