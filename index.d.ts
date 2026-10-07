@@ -193,7 +193,11 @@ export interface OpenOptions {
   pageCacheSize?: number
   /** Open even when the filesystem cannot lock files. Default false. */
   allowUnlocked?: boolean
-  /** WAL entries before an automatic checkpoint. Default 1000. */
+  /**
+   * WAL entries before an automatic checkpoint. Default 1000.
+   * `WAL_CHECKPOINT_NEVER` (2^53 - 1, `Number.MAX_SAFE_INTEGER`) or more
+   * means never: no automatic checkpoint and none when the handle closes.
+   */
   walCheckpointThreshold?: number
   /** Facts a recursive rule may derive per iteration. Default 1,000,000. */
   maxDerivedFacts?: number

@@ -27,3 +27,8 @@ module.exports.LogWriter = binding.LogWriter
 module.exports.MiniGrafDb = binding.MiniGrafDb
 /** `validTo` of a fact that is valid forever. */
 module.exports.VALID_TIME_FOREVER = 9223372036854775807n
+/**
+ * `walCheckpointThreshold` that never checkpoints: no automatic checkpoint and
+ * none when the handle closes. Call `checkpoint()` yourself.
+ */
+module.exports.WAL_CHECKPOINT_NEVER = Number.MAX_SAFE_INTEGER
