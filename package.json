@@ -2,8 +2,8 @@
   "name": "minigraf",
   "version": "1.1.1",
   "description": "Zero-config, single-file, embedded graph database with bi-temporal Datalog queries",
-  "main": "index.js",
-  "types": "index.d.ts",
+  "main": "minigraf.js",
+  "types": "minigraf.d.ts",
   "license": "MIT OR Apache-2.0",
   "repository": {
     "type": "git",
@@ -25,7 +25,7 @@
   },
   "scripts": {
     "build": "napi build --platform --release",
-    "test": "node --test test/basic.test.mjs"
+    "test": "node --test test/basic.test.mjs test/etl.test.mjs"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3"
