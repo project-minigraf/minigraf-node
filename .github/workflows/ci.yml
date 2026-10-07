@@ -2,9 +2,9 @@ name: Node.js CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, v3]
   pull_request:
-    branches: [main]
+    branches: [main, v3]
   workflow_call:
     inputs:
       ref:
@@ -42,4 +42,4 @@ jobs:
         run: npx napi build --platform --release
 
       - name: Run tests
-        run: node --test test/basic.test.mjs
+        run: node --test test/basic.test.mjs test/etl.test.mjs

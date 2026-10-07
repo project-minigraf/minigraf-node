@@ -61,6 +61,41 @@ not at all before the process exits. Reopening before then throws
 `close()` is idempotent; every other method throws once it has run. In-memory
 databases hold no file lock, so closing them is optional.
 
+## Open options, cursors, the fact log and the log writer
+
+```js
+const { MiniGrafDb, LogWriter } = require('minigraf')
+
+// Read-only: shared lock, nothing written; writes throw "[API-014] ...".
+const src = MiniGrafDb.openWithOptions('old.graph', { readOnly: true, pageCacheSize: 4096 })
+
+// A cursor's answer is fixed when it opens. Iterate over rows (decoded like
+// execute()'s results), or call nextBatch(n) for a JSON string of up to n rows.
+for (const row of src.query('(query [:find ?n :where [?e :name ?n]])')) console.log(row)
+
+// Copy every fact version, keeping tx and valid-time bounds, into a new file.
+const out = LogWriter.create('new.graph')
+try {
+  const log = src.factLog({ attributePrefixes: [':app/'] })
+  for (let batch; (batch = log.nextBatch(10000)) !== null; ) out.appendBatch(batch)
+  out.advanceTxCount(src.currentTxCount())
+  out.finish()
+} finally {
+  out.close() // abandons the build (no file) unless finish() ran
+}
+```
+
+Options: `readOnly`, `pageCacheSize`, `allowUnlocked`, `walCheckpointThreshold`,
+`maxDerivedFacts`, `maxResults`, `synchronous` (`'full'` or `'normal'`). Fact filter:
+`attributes`, `attributePrefixes`, `entities` (UUID strings), `txFrom`/`txTo`
+(inclusive, bigint), `order` (`'tx'` or `'storage'`), `window`.
+
+A record's `txCount`, `txId`, `validFrom` and `validTo` are bigints (`validTo` is
+`VALID_TIME_FOREVER` for forever), and its `value` is `{ type, value }` with `type` one
+of `'string'`, `'integer'` (a bigint), `'float'`, `'boolean'`, `'ref'` (a UUID string),
+`'keyword'` or `'null'`, so a record is written back exactly. Error messages start with
+their code, such as `[API-015]`; `appendBatch` ends the message with `(batch index N)`.
+
 ## Building from source
 
 Requires Rust stable toolchain and `@napi-rs/cli`.

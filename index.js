@@ -576,4 +576,7 @@ if (!nativeBinding) {
 }
 
 module.exports = nativeBinding
+module.exports.Cursor = nativeBinding.Cursor
+module.exports.FactLog = nativeBinding.FactLog
+module.exports.LogWriter = nativeBinding.LogWriter
 module.exports.MiniGrafDb = nativeBinding.MiniGrafDb
