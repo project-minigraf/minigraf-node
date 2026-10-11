@@ -280,9 +280,9 @@ checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
 name = "minigraf"
-version = "2.0.4"
+version = "2.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cebd029d6878a9588b9a8d94dc895e79da59df6fce7c72bcbf32fbefe7d0b45f"
+checksum = "88cce58e3c836f1e4b1d74ac69735385cbb5787290e42697668cad85d801cc26"
 dependencies = [
  "anyhow",
  "chrono",
