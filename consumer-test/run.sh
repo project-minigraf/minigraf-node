@@ -30,6 +30,9 @@ wait_for() {
   done
 }
 
+# Resolve the dist directory before leaving the caller's directory.
+if [ "${1:-}" = local ]; then DIST="$(cd "$2" && pwd)"; fi
+
 APP="$(mktemp -d)"
 trap 'rm -rf "$APP"' EXIT
 cd "$APP"
@@ -37,7 +40,7 @@ npm init -y > /dev/null
 
 case "${1:-}" in
   local)
-    DIST="$(cd "$2" && pwd)"; VERSION="$3"
+    VERSION="$3"
     npm install --no-audit --no-fund \
       "$DIST/minigraf-$VERSION.tgz" "$DIST/minigraf-$TRIPLE-$VERSION.tgz"
     ;;
