@@ -67,4 +67,5 @@ echo "installed minigraf $VERSION and @minigraf/$TRIPLE $VERSION"
 cp "$HERE/quickstart.mjs" "$HERE/contract.cjs" .
 node quickstart.mjs
 mkdir db
-node contract.cjs "$APP/db"
+# Relative: the script runs in $APP, and node on Windows gets no Git Bash path.
+node contract.cjs db
