@@ -1,0 +1,148 @@
+name: Package
+
+# Builds the npm tarballs exactly as the release publishes them, stamped with
+# `version`, and uploads them as dist-npm:
+#   minigraf-<version>.tgz                      the root package (loader, types)
+#   minigraf-<triple>-<version>.tgz (4 files)   @minigraf/<triple>, one binary each
+# The macOS binary is the lipo'd universal one the release ships, not the
+# host-arch build `napi build` makes by default.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        required: false
+        type: string
+        default: ''
+      version:
+        required: true
+        type: string
+
+jobs:
+  native:
+    name: Build .node binary (${{ matrix.triple }})
+    runs-on: ${{ matrix.host }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: ubuntu-latest
+            triple: linux-x64-gnu
+            target: x86_64-unknown-linux-gnu
+            rust_targets: x86_64-unknown-linux-gnu
+          - host: ubuntu-24.04-arm
+            triple: linux-arm64-gnu
+            target: aarch64-unknown-linux-gnu
+            rust_targets: aarch64-unknown-linux-gnu
+          - host: macos-14
+            triple: darwin-universal
+            target: universal-apple-darwin
+            rust_targets: aarch64-apple-darwin x86_64-apple-darwin
+          - host: windows-latest
+            triple: win32-x64-msvc
+            target: x86_64-pc-windows-msvc
+            rust_targets: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install npm dependencies
+        run: npm install
+
+      - name: Build native addon
+        shell: bash
+        run: |
+          if [ "${{ matrix.target }}" = "universal-apple-darwin" ]; then
+            npx napi build --platform --release --no-js --target aarch64-apple-darwin
+            npx napi build --platform --release --no-js --target x86_64-apple-darwin
+            lipo -create -output minigraf.darwin-universal.node \
+              minigraf.darwin-arm64.node minigraf.darwin-x64.node
+            rm minigraf.darwin-arm64.node minigraf.darwin-x64.node
+            # The x86_64 slice cannot run on an arm64 runner; check it is there.
+            ARCHS=$(lipo -archs minigraf.darwin-universal.node)
+            echo "archs: $ARCHS"
+            [[ " $ARCHS " == *" x86_64 "* && " $ARCHS " == *" arm64 "* ]] \
+              || { echo "::error::universal binary lacks a slice"; exit 1; }
+          else
+            npx napi build --platform --release --no-js --target "${{ matrix.target }}"
+          fi
+          ls -l minigraf.*.node
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.triple }}
+          path: minigraf.${{ matrix.triple }}.node
+          if-no-files-found: error
+
+  pack:
+    name: Pack npm tarballs
+    needs: native
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: natives
+          merge-multiple: true
+
+      - name: Stamp the version and pack
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          node scripts/stamp-version.js "$VERSION"
+          for dir in packages/@minigraf/*/; do
+            triple=$(basename "$dir")
+            cp "natives/minigraf.$triple.node" "$dir"
+          done
+          mkdir dist
+          for dir in packages/@minigraf/*/; do
+            npm pack "./${dir%/}" --pack-destination dist
+          done
+          npm pack --pack-destination dist
+          ls -l dist
+
+      - name: Check the tarballs
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          [ "$(ls dist | wc -l)" -eq 5 ] || { echo "::error::expected 5 tarballs"; exit 1; }
+          for dir in packages/@minigraf/*/; do
+            triple=$(basename "$dir")
+            tar tzf "dist/minigraf-$triple-$VERSION.tgz" | grep -qx "package/minigraf.$triple.node" \
+              || { echo "::error::@minigraf/$triple has no binary"; exit 1; }
+          done
+          # The root package must not ship a binary of its own: the loader
+          # prefers one next to it, which would bypass the platform package.
+          if tar tzf "dist/minigraf-$VERSION.tgz" | grep -q '\.node$'; then
+            echo "::error::the root package contains a .node binary"; exit 1
+          fi
+          # optionalDependencies pin this version (#7).
+          tar xOzf "dist/minigraf-$VERSION.tgz" package/package.json \
+            | node -e "
+              const pkg = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+              const bad = Object.entries(pkg.optionalDependencies).filter(([, v]) => v !== process.env.VERSION);
+              if (bad.length) { console.error('::error::optionalDependencies not at ' + process.env.VERSION, bad); process.exit(1); }
+            "
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-npm
+          path: dist/*.tgz
+          if-no-files-found: error
