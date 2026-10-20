@@ -67,7 +67,7 @@ Requires Rust stable toolchain and `@napi-rs/cli`.
 
 ```bash
 npm install
-npx napi build --platform --release
+npx napi build --platform --release --no-js
 ```
 
 ## Cascade release
