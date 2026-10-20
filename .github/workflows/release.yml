@@ -80,6 +80,9 @@ jobs:
     uses: ./.github/workflows/ci.yml
     with:
       ref: ${{ needs.prepare.outputs.sha }}
+      # The tarballs are built and consumer-tested here at the release
+      # version; publish uploads exactly these files.
+      version: ${{ needs.prepare.outputs.semver }}
 
   tag:
     name: Push tag and update main
@@ -114,72 +117,9 @@ jobs:
           git push origin --delete "release/$TAG" \
             || echo "::warning::Could not delete branch release/$TAG"
 
-  build:
-    name: Build .node binary (${{ matrix.settings.host }})
-    needs: [prepare, tag]
-    runs-on: ${{ matrix.settings.host }}
-    strategy:
-      fail-fast: false
-      matrix:
-        settings:
-          - host: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact-name: minigraf-linux-x64-gnu
-            rust_targets: x86_64-unknown-linux-gnu
-          - host: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            artifact-name: minigraf-linux-arm64-gnu
-            rust_targets: aarch64-unknown-linux-gnu
-          - host: macos-14
-            target: universal-apple-darwin
-            artifact-name: minigraf-darwin-universal
-            rust_targets: aarch64-apple-darwin x86_64-apple-darwin
-          - host: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact-name: minigraf-win32-x64-msvc
-            rust_targets: x86_64-pc-windows-msvc
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.prepare.outputs.tag }}
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.settings.rust_targets }}
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          registry-url: 'https://registry.npmjs.org'
-
-      - name: Install npm dependencies
-        run: npm install
-
-      - name: Build native addon
-        shell: bash
-        run: |
-          if [ "${{ matrix.settings.target }}" = "universal-apple-darwin" ]; then
-            npx napi build --platform --release --no-js --target aarch64-apple-darwin
-            npx napi build --platform --release --no-js --target x86_64-apple-darwin
-            lipo -create -output minigraf.darwin-universal.node \
-              minigraf.darwin-arm64.node minigraf.darwin-x64.node
-            rm minigraf.darwin-arm64.node minigraf.darwin-x64.node
-          else
-            npx napi build --platform --release --no-js --target "${{ matrix.settings.target }}"
-          fi
-
-      - name: Upload .node binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.settings.artifact-name }}
-          path: "*.node"
-
   publish:
     name: Publish to npm
-    needs: [prepare, build, tag]
+    needs: [prepare, test, tag]
     runs-on: ubuntu-latest
     environment:
       name: npm
@@ -189,58 +129,52 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.prepare.outputs.tag }}
-
       - name: Set up Node.js
         uses: actions/setup-node@v6
         with:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Install npm dependencies
-        run: npm install
-
-      - name: Download all binaries
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          pattern: minigraf-*
-          path: .
-          merge-multiple: true
-
-      - name: Distribute .node binaries to platform packages
-        run: |
-          cp minigraf.linux-x64-gnu.node   packages/@minigraf/linux-x64-gnu/
-          cp minigraf.linux-arm64-gnu.node packages/@minigraf/linux-arm64-gnu/
-          cp minigraf.darwin-universal.node packages/@minigraf/darwin-universal/
-          cp minigraf.win32-x64-msvc.node  packages/@minigraf/win32-x64-msvc/
-
-      # After npm install, so the install does not look for platform package
-      # versions this job has not published yet.
-      - name: Stamp version into package.json and platform packages
-        run: node scripts/stamp-version.js "${{ needs.prepare.outputs.semver }}"
+          name: dist-npm
+          path: dist
 
       # Re-runs are expected (e.g. after a partial failure), so a version that is
       # already on npm is skipped, not treated as an error. Any other npm failure
       # fails the job. The job summary says which packages were actually published.
-      - name: Publish packages
+      # Platform packages first, so the root's optionalDependencies resolve.
+      - name: Publish the tested tarballs
         env:
           VERSION: ${{ needs.prepare.outputs.semver }}
         run: |
           echo "## npm publish — $VERSION" >> "$GITHUB_STEP_SUMMARY"
+          [ "$(ls dist | wc -l)" -eq 5 ] || { echo "::error::expected 5 tarballs"; exit 1; }
           publish() {
-            local dir="$1" name
-            name=$(node -p "require('./$dir/package.json').name")
+            local tgz="$1" name
+            name=$(tar xOzf "$tgz" package/package.json | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).name")
             if [ "$(npm view "$name@$VERSION" version 2>/dev/null)" = "$VERSION" ]; then
               echo "::warning::$name@$VERSION is already on npm; skipping"
               echo "- \`$name@$VERSION\` — already published, skipped" >> "$GITHUB_STEP_SUMMARY"
             else
-              npm publish "$dir" --access public
+              npm publish "$tgz" --access public
               echo "- \`$name@$VERSION\` — published" >> "$GITHUB_STEP_SUMMARY"
             fi
           }
-          for dir in packages/@minigraf/*/; do
-            publish "${dir%/}"
+          for tgz in dist/minigraf-*-"$VERSION".tgz; do
+            publish "$tgz"
           done
-          publish .
+          publish "dist/minigraf-$VERSION.tgz"
+
+  # Installs the published version from npm and runs the consumer test; on
+  # failure the run fails and a release-broken issue is opened.
+  verify-published:
+    name: Verify the published packages
+    needs: [prepare, publish]
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/verify-published.yml
+    with:
+      version: ${{ needs.prepare.outputs.semver }}
+      ref: ${{ needs.prepare.outputs.tag }}
