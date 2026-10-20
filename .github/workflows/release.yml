@@ -162,13 +162,13 @@ jobs:
         shell: bash
         run: |
           if [ "${{ matrix.settings.target }}" = "universal-apple-darwin" ]; then
-            npx napi build --platform --release --target aarch64-apple-darwin
-            npx napi build --platform --release --target x86_64-apple-darwin
+            npx napi build --platform --release --no-js --target aarch64-apple-darwin
+            npx napi build --platform --release --no-js --target x86_64-apple-darwin
             lipo -create -output minigraf.darwin-universal.node \
               minigraf.darwin-arm64.node minigraf.darwin-x64.node
             rm minigraf.darwin-arm64.node minigraf.darwin-x64.node
           else
-            npx napi build --platform --release --target "${{ matrix.settings.target }}"
+            npx napi build --platform --release --no-js --target "${{ matrix.settings.target }}"
           fi
 
       - name: Upload .node binary
@@ -199,17 +199,6 @@ jobs:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Stamp version into package.json
-        run: |
-          VERSION="${{ needs.prepare.outputs.semver }}"
-          node -e "
-            const fs = require('fs');
-            const p = 'package.json';
-            const pkg = JSON.parse(fs.readFileSync(p, 'utf8'));
-            pkg.version = '${VERSION}';
-            fs.writeFileSync(p, JSON.stringify(pkg, null, 2) + '\n');
-          "
-
       - name: Install npm dependencies
         run: npm install
 
@@ -227,17 +216,10 @@ jobs:
           cp minigraf.darwin-universal.node packages/@minigraf/darwin-universal/
           cp minigraf.win32-x64-msvc.node  packages/@minigraf/win32-x64-msvc/
 
-      - name: Sync platform package versions
-        run: |
-          VERSION="${{ needs.prepare.outputs.semver }}"
-          for dir in packages/@minigraf/*/; do
-            node -e "
-              const fs = require('fs');
-              const pkg = JSON.parse(fs.readFileSync('${dir}package.json', 'utf8'));
-              pkg.version = '${VERSION}';
-              fs.writeFileSync('${dir}package.json', JSON.stringify(pkg, null, 2) + '\n');
-            "
-          done
+      # After npm install, so the install does not look for platform package
+      # versions this job has not published yet.
+      - name: Stamp version into package.json and platform packages
+        run: node scripts/stamp-version.js "${{ needs.prepare.outputs.semver }}"
 
       # Re-runs are expected (e.g. after a partial failure), so a version that is
       # already on npm is skipped, not treated as an error. Any other npm failure
