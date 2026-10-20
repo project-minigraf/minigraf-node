@@ -39,7 +39,36 @@ jobs:
         run: npm install
 
       - name: Build native addon
-        run: npx napi build --platform --release
+        run: npx napi build --platform --release --no-js
 
       - name: Run tests
         run: node --test test/basic.test.mjs test/etl.test.mjs
+
+      # Install the packed packages into an empty project, as a user would, with
+      # no binary next to index.js: the loader must find the platform package
+      # and its version must match (#7). macOS packs the host-arch build as the
+      # universal package.
+      - name: Test the packed npm packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(node -p 'process.platform + "-" + process.arch')" in
+            linux-x64)    TRIPLE=linux-x64-gnu;    BUILT=minigraf.linux-x64-gnu.node ;;
+            linux-arm64)  TRIPLE=linux-arm64-gnu;  BUILT=minigraf.linux-arm64-gnu.node ;;
+            darwin-arm64) TRIPLE=darwin-universal; BUILT=minigraf.darwin-arm64.node ;;
+            win32-x64)    TRIPLE=win32-x64-msvc;   BUILT=minigraf.win32-x64-msvc.node ;;
+            *) echo "::error::no platform package for this runner"; exit 1 ;;
+          esac
+          node scripts/stamp-version.js 0.0.0-ci
+          cp "$BUILT" "packages/@minigraf/$TRIPLE/minigraf.$TRIPLE.node"
+          OUT="$RUNNER_TEMP/npm-pack"
+          mkdir -p "$OUT/app"
+          npm pack --pack-destination "$OUT"
+          npm pack "./packages/@minigraf/$TRIPLE" --pack-destination "$OUT"
+          cp test/basic.test.mjs test/etl.test.mjs "$OUT/app/"
+          sed -i.bak -e "s|'../index.js'|'minigraf'|" -e "s|'../minigraf.js'|'minigraf'|" "$OUT/app/basic.test.mjs" "$OUT/app/etl.test.mjs"
+          cd "$OUT/app"
+          npm init -y > /dev/null
+          npm install --no-audit --no-fund "$OUT/minigraf-0.0.0-ci.tgz" "$OUT/minigraf-$TRIPLE-0.0.0-ci.tgz"
+          node -e "require('minigraf')"
+          node --test basic.test.mjs etl.test.mjs

@@ -1,5 +1,5 @@
 'use strict'
-// Package entry point: the native classes from the napi-generated index.js,
+// Package entry point: the native classes from index.js,
 // plus JavaScript iteration over cursors and fact logs. (napi's own iterator
 // support cannot throw, so a failed batch read would end the loop silently.)
 const binding = require('./index.js')
