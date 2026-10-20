@@ -8,6 +8,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(dirname "$HERE")"
 
 case "$(node -p 'process.platform + "-" + process.arch')" in
   linux-x64)    TRIPLE=linux-x64-gnu ;;
@@ -72,3 +73,8 @@ node quickstart.mjs
 mkdir db
 # Relative: the script runs in $APP, and node on Windows gets no Git Bash path.
 node contract.cjs db
+
+# v3: the ETL tests (cursors, fact log, log writer) against the installed
+# package, which also checks that the minigraf.js entry point is shipped.
+sed -e "s|'../minigraf.js'|'minigraf'|" "$ROOT/test/etl.test.mjs" > etl.test.mjs
+node --test etl.test.mjs
