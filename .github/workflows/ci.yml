@@ -12,6 +12,11 @@ on:
         required: false
         type: string
         default: ''
+      version:
+        description: 'Version stamped into the tarballs (release.yml passes the release version)'
+        required: false
+        type: string
+        default: '0.0.0-ci'
 
 jobs:
   test:
@@ -44,31 +49,45 @@ jobs:
       - name: Run tests
         run: node --test test/basic.test.mjs test/etl.test.mjs
 
-      # Install the packed packages into an empty project, as a user would, with
-      # no binary next to index.js: the loader must find the platform package
-      # and its version must match (#7). macOS packs the host-arch build as the
-      # universal package.
-      - name: Test the packed npm packages
+  # Builds the five npm tarballs as the release publishes them, including the
+  # universal macOS binary.
+  package:
+    name: Package
+    uses: ./.github/workflows/package.yml
+    with:
+      ref: ${{ inputs.ref }}
+      version: ${{ inputs.version || '0.0.0-ci' }}
+
+  # Installs the root and this platform's tarball into an empty project and
+  # runs the README quick start (ESM) and the consumer contract (CommonJS).
+  consumer:
+    name: Consumer test (${{ matrix.os }})
+    needs: package
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-npm
+          path: dist-npm
+      - name: Run consumer test
         shell: bash
-        run: |
-          set -euo pipefail
-          case "$(node -p 'process.platform + "-" + process.arch')" in
-            linux-x64)    TRIPLE=linux-x64-gnu;    BUILT=minigraf.linux-x64-gnu.node ;;
-            linux-arm64)  TRIPLE=linux-arm64-gnu;  BUILT=minigraf.linux-arm64-gnu.node ;;
-            darwin-arm64) TRIPLE=darwin-universal; BUILT=minigraf.darwin-arm64.node ;;
-            win32-x64)    TRIPLE=win32-x64-msvc;   BUILT=minigraf.win32-x64-msvc.node ;;
-            *) echo "::error::no platform package for this runner"; exit 1 ;;
-          esac
-          node scripts/stamp-version.js 0.0.0-ci
-          cp "$BUILT" "packages/@minigraf/$TRIPLE/minigraf.$TRIPLE.node"
-          OUT="$RUNNER_TEMP/npm-pack"
-          mkdir -p "$OUT/app"
-          npm pack --pack-destination "$OUT"
-          npm pack "./packages/@minigraf/$TRIPLE" --pack-destination "$OUT"
-          cp test/basic.test.mjs test/etl.test.mjs "$OUT/app/"
-          sed -i.bak -e "s|'../index.js'|'minigraf'|" -e "s|'../minigraf.js'|'minigraf'|" "$OUT/app/basic.test.mjs" "$OUT/app/etl.test.mjs"
-          cd "$OUT/app"
-          npm init -y > /dev/null
-          npm install --no-audit --no-fund "$OUT/minigraf-0.0.0-ci.tgz" "$OUT/minigraf-$TRIPLE-0.0.0-ci.tgz"
-          node -e "require('minigraf')"
-          node --test basic.test.mjs etl.test.mjs
+        run: bash consumer-test/run.sh local dist-npm ${{ inputs.version || '0.0.0-ci' }}
+
+  readme-sync:
+    name: README quick start matches the consumer test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - run: python3 -I consumer-test/readme_sync.py README.md consumer-test/quickstart.mjs
