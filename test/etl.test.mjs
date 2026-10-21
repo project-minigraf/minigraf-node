@@ -184,3 +184,21 @@ test('WAL_CHECKPOINT_NEVER keeps the WAL on close (#322)', (t) => {
   db2.close()
   assert.equal(fs.existsSync(ordinary + '.wal'), false)
 })
+
+test('queryMemoryLimit throws QRY-012 (#549)', (t) => {
+  const p = tmpDir(t)
+  // A cartesian product holds one side in full.
+  const product = '(query [:find ?a ?b :where [?a :n _] [?b :m _]])'
+  const small = MiniGrafDb.openWithOptions(p('small.graph'), { queryMemoryLimit: 64 })
+  small.execute('(transact [[:a :n 1] [:b :m 2]])')
+  throwsCode(() => small.execute(product), 'QRY-012')
+  throwsCode(() => small.query(product).nextBatch(10), 'QRY-012')
+  small.close()
+
+  const max = MiniGrafDb.openWithOptions(p('max.graph'), { queryMemoryLimit: Number.MAX_SAFE_INTEGER })
+  max.execute('(transact [[:a :n 1] [:b :m 2]])')
+  assert.equal(JSON.parse(max.execute(product)).results.length, 1)
+  max.close()
+
+  throwsCode(() => MiniGrafDb.openWithOptions(p('neg.graph'), { queryMemoryLimit: -1 }), 'API-017')
+})

@@ -84,9 +84,10 @@ fn rows_to_json(rows: &[Vec<Value>]) -> String {
 
 // ─── Options, values and fact records ────────────────────────────────────────
 
-/// `walCheckpointThreshold` from which a handle never checkpoints:
 /// `Number.MAX_SAFE_INTEGER`, the largest integer a JS number holds exactly.
-const WAL_CHECKPOINT_NEVER: i64 = (1 << 53) - 1;
+/// From it up, `walCheckpointThreshold` never checkpoints and
+/// `queryMemoryLimit` is no limit: core's `usize::MAX`.
+const MAX_SAFE_INTEGER: i64 = (1 << 53) - 1;
 
 /// Options for `MiniGrafDb.openWithOptions` and `LogWriter.create`. Every field
 /// is optional; an absent field keeps the Rust default.
@@ -105,11 +106,15 @@ pub struct OpenOptions {
     pub wal_checkpoint_threshold: Option<i64>,
     /// Facts a recursive rule may derive per iteration. Default 1,000,000.
     pub max_derived_facts: Option<i64>,
-    /// Rows a query may return. Default 1,000,000.
+    /// Deprecated alias of `maxDerivedFacts`; the lower of the two applies.
     pub max_results: Option<i64>,
     /// WAL durability: `"full"` (default) or `"normal"`.
     #[napi(ts_type = "'full' | 'normal'")]
     pub synchronous: Option<String>,
+    /// The most bytes one query may hold; a query that would hold more throws
+    /// QRY-012. Default no limit; 2^53 - 1 (`Number.MAX_SAFE_INTEGER`) or more
+    /// also means no limit.
+    pub query_memory_limit: Option<i64>,
 }
 
 impl OpenOptions {
@@ -127,7 +132,7 @@ impl OpenOptions {
         if let Some(v) = self.wal_checkpoint_threshold {
             // JS numbers cannot hold core's usize::MAX sentinel, so anything
             // from Number.MAX_SAFE_INTEGER up stands for it.
-            let n = if v >= WAL_CHECKPOINT_NEVER {
+            let n = if v >= MAX_SAFE_INTEGER {
                 usize::MAX
             } else {
                 to_usize(v, "walCheckpointThreshold")?
@@ -138,7 +143,20 @@ impl OpenOptions {
             o = o.max_derived_facts(to_usize(v, "maxDerivedFacts")?);
         }
         if let Some(v) = self.max_results {
-            o = o.max_results(to_usize(v, "maxResults")?);
+            #[allow(deprecated)]
+            {
+                o = o.max_results(to_usize(v, "maxResults")?);
+            }
+        }
+        if let Some(v) = self.query_memory_limit {
+            // As for walCheckpointThreshold: anything from
+            // Number.MAX_SAFE_INTEGER up stands for core's usize::MAX.
+            let n = if v >= MAX_SAFE_INTEGER {
+                usize::MAX
+            } else {
+                to_usize(v, "queryMemoryLimit")?
+            };
+            o = o.query_memory_limit(n);
         }
         match self.synchronous.as_deref() {
             None => {}
