@@ -86,7 +86,8 @@ try {
 ```
 
 Options: `readOnly`, `pageCacheSize`, `allowUnlocked`, `walCheckpointThreshold`,
-`maxDerivedFacts`, `maxResults`, `synchronous` (`'full'` or `'normal'`). Fact filter:
+`maxDerivedFacts`, `maxResults`, `synchronous` (`'full'` or `'normal'`),
+`queryMemoryLimit`. Fact filter:
 `attributes`, `attributePrefixes`, `entities` (UUID strings), `txFrom`/`txTo`
 (inclusive, bigint), `order` (`'tx'` or `'storage'`), `window`.
 
@@ -95,6 +96,12 @@ A record's `txCount`, `txId`, `validFrom` and `validTo` are bigints (`validTo` i
 of `'string'`, `'integer'` (a bigint), `'float'`, `'boolean'`, `'ref'` (a UUID string),
 `'keyword'` or `'null'`, so a record is written back exactly. Error messages start with
 their code, such as `[API-015]`; `appendBatch` ends the message with `(batch index N)`.
+
+`queryMemoryLimit` caps the bytes one query may hold, counted per entry by the operators
+that keep state (join build sides, negation and `or` tables, distinct sets, aggregate
+groups, window rows, rule-derived facts). A query that would hold more throws QRY-012 and
+frees what it held. The default, and `Number.MAX_SAFE_INTEGER` or more, is no limit. Rows
+a cursor returns are not counted, so read a large answer with `query()`.
 
 ## Building from source
 
