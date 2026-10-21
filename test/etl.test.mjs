@@ -192,7 +192,9 @@ test('queryMemoryLimit throws QRY-012 (#549)', (t) => {
   const small = MiniGrafDb.openWithOptions(p('small.graph'), { queryMemoryLimit: 64 })
   small.execute('(transact [[:a :n 1] [:b :m 2]])')
   throwsCode(() => small.execute(product), 'QRY-012')
-  throwsCode(() => small.query(product).nextBatch(10), 'QRY-012')
+  const cursor = small.query(product)
+  throwsCode(() => cursor.nextBatch(10), 'QRY-012')
+  cursor.close()
   small.close()
 
   const max = MiniGrafDb.openWithOptions(p('max.graph'), { queryMemoryLimit: Number.MAX_SAFE_INTEGER })
