@@ -157,7 +157,8 @@ jobs:
               echo "::warning::$name@$VERSION is already on npm; skipping"
               echo "- \`$name@$VERSION\` — already published, skipped" >> "$GITHUB_STEP_SUMMARY"
             else
-              npm publish "$tgz" --access public
+              # "./": npm reads a bare "dist/x.tgz" as GitHub shorthand (user/repo).
+              npm publish "./$tgz" --access public
               echo "- \`$name@$VERSION\` — published" >> "$GITHUB_STEP_SUMMARY"
             fi
           }
