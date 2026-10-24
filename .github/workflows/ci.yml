@@ -47,7 +47,7 @@ jobs:
         run: npx napi build --platform --release --no-js
 
       - name: Run tests
-        run: node --test test/basic.test.mjs test/etl.test.mjs
+        run: node --test test/basic.test.mjs test/etl.test.mjs test/prepared.test.mjs
 
   # Builds the five npm tarballs as the release publishes them, including the
   # universal macOS binary.

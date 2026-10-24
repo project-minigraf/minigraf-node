@@ -25,6 +25,7 @@ module.exports.Cursor = binding.Cursor
 module.exports.FactLog = binding.FactLog
 module.exports.LogWriter = binding.LogWriter
 module.exports.MiniGrafDb = binding.MiniGrafDb
+module.exports.PreparedQuery = binding.PreparedQuery
 /** `validTo` of a fact that is valid forever. */
 module.exports.VALID_TIME_FOREVER = 9223372036854775807n
 /**

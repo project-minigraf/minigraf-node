@@ -103,6 +103,29 @@ groups, window rows, rule-derived facts). A query that would hold more throws QR
 frees what it held. The default, and `Number.MAX_SAFE_INTEGER` or more, is no limit. Rows
 a cursor returns are not counted, so read a large answer with `query()`.
 
+## Prepared queries
+
+`db.prepare(text)` parses a query once; `execute(bindings)` and `query(bindings)` run it
+with its `$slots` bound (names without the `$`). Each run reads the database as it is then.
+
+```js
+const pq = db.prepare('(query [:find ?n :where [?e :age $age] [?e :name ?n]])')
+JSON.parse(pq.execute({ age: 30 })).results
+for (const row of pq.query({ age: 40n })) console.log(row)
+```
+
+A boolean, a string, `null`, a `bigint` and a `number` bind as values; a `number` is an
+integer when `Number.isInteger` accepts it, else a float. Use a typed form for the other
+kinds: a `FactValue` such as `{ type: 'float', value: 2 }`, `{ type: 'keyword', value: ':k' }`
+or `{ type: 'ref', value: uuid }`; `{ type: 'entity', value: uuid }`; `{ type: 'txCount',
+value: 5 }` or `{ type: 'timestamp', value: Date.now() }` for `:as-of`; and
+`{ type: 'anyValidTime' }` for `:valid-at`. Anything else throws a `TypeError`. A missing
+slot throws `[API-022]`, a slot in an attribute position `[API-023]`, and a value of the
+wrong kind `[API-024]`.
+
+`db.close()` also releases every prepared query made from it, so the path can be opened
+again; a prepared query used after that throws `[API-018] database is closed`.
+
 ## Building from source
 
 Requires Rust stable toolchain and `@napi-rs/cli`.

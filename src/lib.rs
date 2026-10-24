@@ -1,7 +1,8 @@
 use minigraf::{MinigrafError, QueryResult, Value};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, Weak};
 
 fn js_err(e: MinigrafError) -> Error {
     Error::new(Status::GenericFailure, e.to_string())
@@ -20,7 +21,9 @@ fn bigint_to_i64(b: &BigInt, what: &str) -> Result<i64> {
     if lossless {
         Ok(n)
     } else {
-        Err(invalid(format!("{what} does not fit in a signed 64-bit integer")))
+        Err(invalid(format!(
+            "{what} does not fit in a signed 64-bit integer"
+        )))
     }
 }
 
@@ -29,7 +32,9 @@ fn bigint_to_u64(b: &BigInt, what: &str) -> Result<u64> {
     if lossless && !negative {
         Ok(n)
     } else {
-        Err(invalid(format!("{what} must be a non-negative 64-bit integer")))
+        Err(invalid(format!(
+            "{what} must be a non-negative 64-bit integer"
+        )))
     }
 }
 
@@ -162,7 +167,11 @@ impl OpenOptions {
             None => {}
             Some("full") => o = o.synchronous(minigraf::SyncMode::Full),
             Some("normal") => o = o.synchronous(minigraf::SyncMode::Normal),
-            Some(other) => return Err(invalid(format!("synchronous {other:?} is not 'full' or 'normal'"))),
+            Some(other) => {
+                return Err(invalid(format!(
+                    "synchronous {other:?} is not 'full' or 'normal'"
+                )));
+            }
         }
         Ok(o)
     }
@@ -177,7 +186,10 @@ fn options_to_core(options: Option<OpenOptions>) -> Result<minigraf::OpenOptions
 /// string), `"keyword"` or `"null"` (no `value`).
 #[napi(object)]
 pub struct FactValue {
-    #[napi(js_name = "type", ts_type = "'string' | 'integer' | 'float' | 'boolean' | 'ref' | 'keyword' | 'null'")]
+    #[napi(
+        js_name = "type",
+        ts_type = "'string' | 'integer' | 'float' | 'boolean' | 'ref' | 'keyword' | 'null'"
+    )]
     pub kind: String,
     pub value: Option<Either4<String, f64, BigInt, bool>>,
 }
@@ -300,15 +312,23 @@ impl FactFilter {
             f = f.entities(ids);
         }
         if self.tx_from.is_some() || self.tx_to.is_some() {
-            let lo = self.tx_from.as_ref().map_or(Ok(0), |b| bigint_to_u64(b, "txFrom"))?;
-            let hi = self.tx_to.as_ref().map_or(Ok(u64::MAX), |b| bigint_to_u64(b, "txTo"))?;
+            let lo = self
+                .tx_from
+                .as_ref()
+                .map_or(Ok(0), |b| bigint_to_u64(b, "txFrom"))?;
+            let hi = self
+                .tx_to
+                .as_ref()
+                .map_or(Ok(u64::MAX), |b| bigint_to_u64(b, "txTo"))?;
             f = f.tx_range(lo..=hi);
         }
         match self.order.as_deref() {
             None => {}
             Some("tx") => f = f.order(minigraf::FactOrder::Tx),
             Some("storage") => f = f.order(minigraf::FactOrder::Storage),
-            Some(other) => return Err(invalid(format!("order {other:?} is not 'tx' or 'storage'"))),
+            Some(other) => {
+                return Err(invalid(format!("order {other:?} is not 'tx' or 'storage'")));
+            }
         }
         if let Some(w) = self.window {
             f = f.window(to_usize(w, "window")?);
@@ -328,6 +348,9 @@ pub struct MiniGrafDb {
     /// destructor, so the handle needs an explicit way to be dropped — see
     /// `close()`.
     inner: Arc<Mutex<Option<minigraf::Minigraf>>>,
+    /// Every prepared query made from this handle, emptied by `close()` so
+    /// that none keeps the file open.
+    prepared: Mutex<Vec<Weak<PreparedSlot>>>,
 }
 
 #[napi]
@@ -342,6 +365,7 @@ impl MiniGrafDb {
             .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
         Ok(Self {
             inner: Arc::new(Mutex::new(Some(db))),
+            prepared: Mutex::default(),
         })
     }
 
@@ -352,6 +376,7 @@ impl MiniGrafDb {
             .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
         Ok(Self {
             inner: Arc::new(Mutex::new(Some(db))),
+            prepared: Mutex::default(),
         })
     }
 
@@ -366,6 +391,7 @@ impl MiniGrafDb {
             .map_err(js_err)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(Some(db))),
+            prepared: Mutex::default(),
         })
     }
 
@@ -386,6 +412,25 @@ impl MiniGrafDb {
         let filter = filter.unwrap_or_default().to_core()?;
         let log = self.with_db(|db| db.fact_log(&filter))?;
         Ok(FactLog { inner: Some(log) })
+    }
+
+    /// Parse and validate a `(query ...)` once, for running many times with
+    /// different bind values in its `$name` slots. Throws API-005/006/007 for
+    /// a transact, retract or rule, and API-023 for a slot in an attribute
+    /// position.
+    #[napi]
+    pub fn prepare(&self, datalog: String) -> Result<PreparedQuery> {
+        // Holding `inner` until the slot is listed: a `close()` cannot run in
+        // between and miss it.
+        let guard = self.inner.lock().map_err(|_| poisoned())?;
+        let db = guard
+            .as_ref()
+            .ok_or_else(|| Error::new(Status::GenericFailure, CLOSED_MSG))?;
+        let slot = Arc::new(Mutex::new(Some(db.prepare(&datalog).map_err(js_err)?)));
+        let mut prepared = self.prepared.lock().map_err(|_| poisoned())?;
+        prepared.retain(|w| w.strong_count() > 0);
+        prepared.push(Arc::downgrade(&slot));
+        Ok(PreparedQuery { slot })
     }
 
     /// The transaction counter that `:as-of N` compares against.
@@ -457,6 +502,14 @@ impl MiniGrafDb {
             .inner
             .lock()
             .map_err(|_| Error::new(Status::GenericFailure, "mutex poisoned"))?;
+        // A prepared query holds the file open too (core's PreparedQuery
+        // keeps the storage), so release every one first.
+        let prepared = std::mem::take(&mut *self.prepared.lock().map_err(|_| poisoned())?);
+        for slot in prepared.iter().filter_map(Weak::upgrade) {
+            if let Ok(mut q) = slot.lock() {
+                *q = None;
+            }
+        }
         // Dropping the last Minigraf clone runs its Drop impl: a best-effort
         // checkpoint, then release of the sidecar `.graph.lock`.
         *guard = None;
@@ -478,6 +531,270 @@ impl MiniGrafDb {
             .ok_or_else(|| Error::new(Status::GenericFailure, CLOSED_MSG))?;
         f(db).map_err(js_err)
     }
+}
+
+fn poisoned() -> Error {
+    Error::new(Status::GenericFailure, "mutex poisoned")
+}
+
+// ─── Prepared queries ────────────────────────────────────────────────────────
+
+/// A prepared query, `None` once its database is closed.
+type PreparedSlot = Mutex<Option<minigraf::PreparedQuery>>;
+
+/// A query parsed once by `MiniGrafDb.prepare`, run with bind values.
+///
+/// A boolean, a string, `null`, a `bigint` and a `number` (an integer when
+/// `Number.isInteger` accepts it, else a float) bind as values. The typed
+/// forms are `FactValue` (`{ type: 'float', value: 2 }` for a float with no
+/// fraction, `'keyword'`, `'ref'`, ...), `{ type: 'entity', value: uuid }`,
+/// `{ type: 'txCount' | 'timestamp', value }` and `{ type: 'anyValidTime' }`.
+/// Anything else is a `TypeError`. Each run reads the database as it is then;
+/// after the database's `close()` every call throws API-018.
+#[napi]
+pub struct PreparedQuery {
+    slot: Arc<PreparedSlot>,
+}
+
+#[napi]
+impl PreparedQuery {
+    /// Run the query with `bindings` and return its result as JSON, encoded
+    /// like `MiniGrafDb.execute`. A missing slot throws API-022 and a bind
+    /// value of the wrong kind API-024.
+    #[napi]
+    pub fn execute(
+        &self,
+        env: Env,
+        #[napi(
+            ts_arg_type = "Record<string, boolean | number | bigint | string | null | FactValue | { type: 'entity'; value: string } | { type: 'txCount' | 'timestamp'; value: number | bigint } | { type: 'anyValidTime' }>"
+        )]
+        bindings: Option<Unknown>,
+    ) -> Result<String> {
+        let binds = read_bindings(&env, bindings)?;
+        let result = self.with_query(|q| q.execute(&as_slice(&binds)))?;
+        Ok(query_result_to_json(result))
+    }
+
+    /// Run the query with `bindings` and return a cursor over its rows. The
+    /// answer is fixed when the cursor opens.
+    #[napi]
+    pub fn query(
+        &self,
+        env: Env,
+        #[napi(
+            ts_arg_type = "Record<string, boolean | number | bigint | string | null | FactValue | { type: 'entity'; value: string } | { type: 'txCount' | 'timestamp'; value: number | bigint } | { type: 'anyValidTime' }>"
+        )]
+        bindings: Option<Unknown>,
+    ) -> Result<Cursor> {
+        let binds = read_bindings(&env, bindings)?;
+        let cursor = self.with_query(|q| q.query(&as_slice(&binds)))?;
+        Ok(Cursor {
+            vars: cursor.vars().to_vec(),
+            inner: Some(cursor),
+        })
+    }
+}
+
+impl PreparedQuery {
+    fn with_query<T>(
+        &self,
+        f: impl FnOnce(&minigraf::PreparedQuery) -> std::result::Result<T, MinigrafError>,
+    ) -> Result<T> {
+        let guard = self.slot.lock().map_err(|_| poisoned())?;
+        let q = guard
+            .as_ref()
+            .ok_or_else(|| js_err(MinigrafError::closed("database")))?;
+        f(q).map_err(js_err)
+    }
+}
+
+fn as_slice(binds: &[(String, minigraf::BindValue)]) -> Vec<(&str, minigraf::BindValue)> {
+    binds.iter().map(|(n, v)| (n.as_str(), v.clone())).collect()
+}
+
+/// Why a JavaScript value is not a bind value.
+enum BindError {
+    /// Not a bind value at all: thrown as a `TypeError`.
+    Type(String),
+    /// A typed value that does not fit its type, and other errors.
+    Napi(Error),
+}
+
+impl From<Error> for BindError {
+    fn from(e: Error) -> Self {
+        BindError::Napi(e)
+    }
+}
+
+fn read_bindings(
+    env: &Env,
+    bindings: Option<Unknown>,
+) -> Result<Vec<(String, minigraf::BindValue)>> {
+    read_bindings_inner(bindings).map_err(|e| match e {
+        BindError::Napi(e) => e,
+        BindError::Type(msg) => match env.throw_type_error(&msg, None) {
+            // The TypeError is pending; this status tells napi not to replace it.
+            Ok(()) => Error::new(Status::PendingException, msg),
+            Err(e) => e,
+        },
+    })
+}
+
+fn read_bindings_inner(
+    bindings: Option<Unknown>,
+) -> std::result::Result<Vec<(String, minigraf::BindValue)>, BindError> {
+    let Some(bindings) = bindings else {
+        return Ok(Vec::new());
+    };
+    match bindings.get_type()? {
+        ValueType::Undefined | ValueType::Null => return Ok(Vec::new()),
+        ValueType::Object if !bindings.is_array()? => {}
+        _ => {
+            return Err(BindError::Type(
+                "bindings must be an object of slot name to bind value".into(),
+            ));
+        }
+    }
+    // SAFETY: get_type() said Object.
+    let object: Object = unsafe { bindings.cast() }?;
+    let values: HashMap<String, Unknown> = unsafe { bindings.cast() }?;
+    Object::keys(&object)?
+        .into_iter()
+        .map(|name| {
+            let v = values
+                .get(&name)
+                .ok_or_else(|| BindError::Type(format!("slot ${name} has no value")))?;
+            let bind = bind_value(&name, v)?;
+            Ok((name, bind))
+        })
+        .collect()
+}
+
+fn bind_value(name: &str, v: &Unknown) -> std::result::Result<minigraf::BindValue, BindError> {
+    use minigraf::BindValue as B;
+    // SAFETY: each cast follows the get_type() it matches.
+    Ok(match v.get_type()? {
+        ValueType::Boolean => B::Val(Value::Boolean(unsafe { v.cast::<bool>() }?)),
+        ValueType::Null => B::Val(Value::Null),
+        ValueType::String => B::Val(Value::String(unsafe { v.cast::<String>() }?)),
+        ValueType::BigInt => B::Val(Value::Integer(bigint_to_i64(
+            &unsafe { v.cast::<BigInt>() }?,
+            &format!("slot ${name}"),
+        )?)),
+        ValueType::Number => {
+            let f = unsafe { v.cast::<f64>() }?;
+            if is_integer(f) {
+                B::Val(Value::Integer(number_to_i64(f, &format!("slot ${name}"))?))
+            } else {
+                B::Val(Value::Float(f))
+            }
+        }
+        ValueType::Object if !v.is_array()? => {
+            let object: Object = unsafe { v.cast() }?;
+            // A getter that throws propagates its error.
+            let kind = match object.get::<Unknown>("type")? {
+                Some(k) if k.get_type()? == ValueType::String => {
+                    Some(unsafe { k.cast::<String>() }?)
+                }
+                _ => None,
+            };
+            match kind.and_then(|k| typed_value(name, &k, &object).transpose()) {
+                Some(bind) => bind?,
+                None => return Err(not_a_bind_value(name)),
+            }
+        }
+        _ => return Err(not_a_bind_value(name)),
+    })
+}
+
+fn not_a_bind_value(name: &str) -> BindError {
+    BindError::Type(format!(
+        "slot ${name}: a bind value is a boolean, number, bigint, string, null or {{type, value}} object"
+    ))
+}
+
+/// `Number.isInteger`.
+fn is_integer(f: f64) -> bool {
+    f.is_finite() && f.trunc() == f
+}
+
+/// A whole `number` as an `i64`; API-017 outside its range.
+fn number_to_i64(f: f64, what: &str) -> Result<i64> {
+    // -2^63 is exact as an f64, and 2^63 is the first whole f64 past i64::MAX.
+    if (i64::MIN as f64..-(i64::MIN as f64)).contains(&f) {
+        Ok(f as i64)
+    } else {
+        Err(invalid(format!(
+            "{what}: {f} does not fit in a signed 64-bit integer"
+        )))
+    }
+}
+
+/// A typed `{ type, value }` form, or `None` if `kind` names no type.
+fn typed_value(
+    name: &str,
+    kind: &str,
+    object: &Object,
+) -> std::result::Result<Option<minigraf::BindValue>, BindError> {
+    use minigraf::BindValue as B;
+    let what = format!("slot ${name} of type {kind:?}");
+    let mismatch = || {
+        BindError::Napi(invalid(format!(
+            "{what}: the value does not match the type"
+        )))
+    };
+    let value: Option<Unknown> = object.get("value")?;
+    let string = || -> std::result::Result<String, BindError> {
+        match &value {
+            Some(v) if v.get_type()? == ValueType::String => Ok(unsafe { v.cast::<String>() }?),
+            _ => Err(mismatch()),
+        }
+    };
+    let integer = || -> std::result::Result<i64, BindError> {
+        match &value {
+            Some(v) if v.get_type()? == ValueType::BigInt => {
+                Ok(bigint_to_i64(&unsafe { v.cast::<BigInt>() }?, &what)?)
+            }
+            Some(v) if v.get_type()? == ValueType::Number => {
+                let f = unsafe { v.cast::<f64>() }?;
+                if is_integer(f) {
+                    Ok(number_to_i64(f, &what)?)
+                } else {
+                    Err(mismatch())
+                }
+            }
+            _ => Err(mismatch()),
+        }
+    };
+    Ok(Some(match kind {
+        "string" => B::Val(Value::String(string()?)),
+        "keyword" => B::Val(Value::Keyword(string()?)),
+        "boolean" => match &value {
+            Some(v) if v.get_type()? == ValueType::Boolean => {
+                B::Val(Value::Boolean(unsafe { v.cast::<bool>() }?))
+            }
+            _ => return Err(mismatch()),
+        },
+        "integer" => B::Val(Value::Integer(integer()?)),
+        "float" => match &value {
+            Some(v) if v.get_type()? == ValueType::Number => {
+                B::Val(Value::Float(unsafe { v.cast::<f64>() }?))
+            }
+            _ => return Err(mismatch()),
+        },
+        "ref" => B::Val(Value::Ref(parse_uuid(&string()?, &what)?)),
+        "entity" => B::Entity(parse_uuid(&string()?, &what)?),
+        "txCount" => {
+            let n = integer()?;
+            B::TxCount(u64::try_from(n).map_err(|_| invalid(format!("{what}: {n} is negative")))?)
+        }
+        "timestamp" => B::Timestamp(integer()?),
+        // These two take no value.
+        "null" if value.is_none() => B::Val(Value::Null),
+        "anyValidTime" if value.is_none() => B::AnyValidTime,
+        "null" | "anyValidTime" => return Err(mismatch()),
+        _ => return Ok(None),
+    }))
 }
 
 // ─── Cursor ──────────────────────────────────────────────────────────────────

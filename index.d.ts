@@ -87,6 +87,13 @@ export declare class MiniGrafDb {
    * the log is closed or read to the end.
    */
   factLog(filter?: FactFilter | undefined | null): FactLog
+  /**
+   * Parse and validate a `(query ...)` once, for running many times with
+   * different bind values in its `$name` slots. Throws API-005/006/007 for
+   * a transact, retract or rule, and API-023 for a slot in an attribute
+   * position.
+   */
+  prepare(datalog: string): PreparedQuery
   /** The transaction counter that `:as-of N` compares against. */
   currentTxCount(): bigint
   /** Execute a Datalog string. Returns a JSON string. Throws on error. */
@@ -124,6 +131,31 @@ export declare class MiniGrafDb {
    * ```
    */
   close(): void
+}
+
+/**
+ * A query parsed once by `MiniGrafDb.prepare`, run with bind values.
+ *
+ * A boolean, a string, `null`, a `bigint` and a `number` (an integer when
+ * `Number.isInteger` accepts it, else a float) bind as values. The typed
+ * forms are `FactValue` (`{ type: 'float', value: 2 }` for a float with no
+ * fraction, `'keyword'`, `'ref'`, ...), `{ type: 'entity', value: uuid }`,
+ * `{ type: 'txCount' | 'timestamp', value }` and `{ type: 'anyValidTime' }`.
+ * Anything else is a `TypeError`. Each run reads the database as it is then;
+ * after the database's `close()` every call throws API-018.
+ */
+export declare class PreparedQuery {
+  /**
+   * Run the query with `bindings` and return its result as JSON, encoded
+   * like `MiniGrafDb.execute`. A missing slot throws API-022 and a bind
+   * value of the wrong kind API-024.
+   */
+  execute(bindings?: Record<string, boolean | number | bigint | string | null | FactValue | { type: 'entity'; value: string } | { type: 'txCount' | 'timestamp'; value: number | bigint } | { type: 'anyValidTime' }>): string
+  /**
+   * Run the query with `bindings` and return a cursor over its rows. The
+   * answer is fixed when the cursor opens.
+   */
+  query(bindings?: Record<string, boolean | number | bigint | string | null | FactValue | { type: 'entity'; value: string } | { type: 'txCount' | 'timestamp'; value: number | bigint } | { type: 'anyValidTime' }>): Cursor
 }
 
 /**
