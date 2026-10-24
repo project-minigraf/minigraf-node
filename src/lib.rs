@@ -691,7 +691,13 @@ fn bind_value(name: &str, v: &Unknown) -> std::result::Result<minigraf::BindValu
         }
         ValueType::Object if !v.is_array()? => {
             let object: Object = unsafe { v.cast() }?;
-            let kind: Option<String> = object.get("type").unwrap_or(None);
+            // A getter that throws propagates its error.
+            let kind = match object.get::<Unknown>("type")? {
+                Some(k) if k.get_type()? == ValueType::String => {
+                    Some(unsafe { k.cast::<String>() }?)
+                }
+                _ => None,
+            };
             match kind.and_then(|k| typed_value(name, &k, &object).transpose()) {
                 Some(bind) => bind?,
                 None => return Err(not_a_bind_value(name)),

@@ -76,6 +76,8 @@ test('bad bindings are rejected', () => {
     assert.throws(() => pq.execute({ n: bad }), TypeError)
   }
   assert.throws(() => pq.execute(1), TypeError)
+  const boom = { get type () { throw new RangeError('boom') } }
+  assert.throws(() => pq.execute({ n: boom }), RangeError, 'a throwing getter propagates')
   throwsCode(() => pq.execute({}), 'API-022')
   throwsCode(() => pq.execute(), 'API-022')
   throwsCode(() => pq.query({}), 'API-022')
