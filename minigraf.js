@@ -20,6 +20,32 @@ binding.FactLog.prototype[Symbol.iterator] = function* records() {
   }
 }
 
+// A JS `Set` binds as the typed form `{ type: 'set', value: [...] }`
+// (minigraf#316), in a typed set's elements too, so a set inside a set
+// reaches the native reader and fails with API-021.
+function setForm(v) {
+  if (v instanceof Set) return { type: 'set', value: Array.from(v, setForm) }
+  if (v !== null && typeof v === 'object' && v.type === 'set' && Array.isArray(v.value)) {
+    return { type: 'set', value: v.value.map(setForm) }
+  }
+  return v
+}
+
+function bindings(b) {
+  if (b === null || typeof b !== 'object' || Array.isArray(b)) return b
+  // A null prototype keeps a slot named __proto__ an own property.
+  const out = Object.create(null)
+  for (const [name, v] of Object.entries(b)) out[name] = setForm(v)
+  return out
+}
+
+for (const method of ['execute', 'query']) {
+  const native = binding.PreparedQuery.prototype[method]
+  binding.PreparedQuery.prototype[method] = function (b) {
+    return native.call(this, bindings(b))
+  }
+}
+
 // Assigned one by one so that ESM `import { ... }` can see the names.
 module.exports.Cursor = binding.Cursor
 module.exports.FactLog = binding.FactLog

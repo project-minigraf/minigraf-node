@@ -56,6 +56,9 @@ fn value_to_json(v: &Value) -> serde_json::Value {
         Value::Ref(u) => J::String(u.to_string()),
         Value::Keyword(k) => J::String(k.clone()),
         Value::Null => J::Null,
+        Value::Set(set) => J::Array(set.iter().map(value_to_json).collect()),
+        // A value kind newer than this binding: its debug form.
+        other => J::String(format!("{other:?}")),
     }
 }
 
@@ -183,27 +186,37 @@ fn options_to_core(options: Option<OpenOptions>) -> Result<minigraf::OpenOptions
 
 /// A fact value with its type kept: `type` is one of `"string"`, `"integer"`
 /// (`value` a bigint), `"float"`, `"boolean"`, `"ref"` (an entity UUID
-/// string), `"keyword"` or `"null"` (no `value`).
+/// string), `"keyword"`, `"null"` (no `value`) or `"set"` (`value` an array
+/// of `FactValue`s, none a set, in canonical order; minigraf#316).
 #[napi(object)]
 pub struct FactValue {
     #[napi(
         js_name = "type",
-        ts_type = "'string' | 'integer' | 'float' | 'boolean' | 'ref' | 'keyword' | 'null'"
+        ts_type = "'string' | 'integer' | 'float' | 'boolean' | 'ref' | 'keyword' | 'null' | 'set'"
     )]
     pub kind: String,
-    pub value: Option<Either4<String, f64, BigInt, bool>>,
+    #[napi(ts_type = "string | number | bigint | boolean | Array<FactValue>")]
+    pub value: Option<Either5<String, f64, BigInt, bool, Vec<FactValue>>>,
 }
 
 impl From<Value> for FactValue {
     fn from(v: Value) -> Self {
         let (kind, value) = match v {
-            Value::String(s) => ("string", Some(Either4::A(s))),
-            Value::Integer(i) => ("integer", Some(Either4::C(BigInt::from(i)))),
-            Value::Float(f) => ("float", Some(Either4::B(f))),
-            Value::Boolean(b) => ("boolean", Some(Either4::D(b))),
-            Value::Ref(id) => ("ref", Some(Either4::A(id.to_string()))),
-            Value::Keyword(k) => ("keyword", Some(Either4::A(k))),
+            Value::String(s) => ("string", Some(Either5::A(s))),
+            Value::Integer(i) => ("integer", Some(Either5::C(BigInt::from(i)))),
+            Value::Float(f) => ("float", Some(Either5::B(f))),
+            Value::Boolean(b) => ("boolean", Some(Either5::D(b))),
+            Value::Ref(id) => ("ref", Some(Either5::A(id.to_string()))),
+            Value::Keyword(k) => ("keyword", Some(Either5::A(k))),
             Value::Null => ("null", None),
+            Value::Set(set) => (
+                "set",
+                Some(Either5::E(
+                    set.iter().cloned().map(FactValue::from).collect(),
+                )),
+            ),
+            // A value kind newer than this binding: its debug form.
+            other => ("string", Some(Either5::A(format!("{other:?}")))),
         };
         FactValue {
             kind: kind.to_string(),
@@ -216,13 +229,22 @@ impl FactValue {
     fn to_core(&self) -> Result<Value> {
         let mismatch = || invalid(format!("value does not match its type {:?}", self.kind));
         Ok(match (self.kind.as_str(), &self.value) {
-            ("string", Some(Either4::A(s))) => Value::String(s.clone()),
-            ("integer", Some(Either4::C(b))) => Value::Integer(bigint_to_i64(b, "integer value")?),
-            ("float", Some(Either4::B(f))) => Value::Float(*f),
-            ("boolean", Some(Either4::D(b))) => Value::Boolean(*b),
-            ("ref", Some(Either4::A(s))) => Value::Ref(parse_uuid(s, "ref value")?),
-            ("keyword", Some(Either4::A(k))) => Value::Keyword(k.clone()),
+            ("string", Some(Either5::A(s))) => Value::String(s.clone()),
+            ("integer", Some(Either5::C(b))) => Value::Integer(bigint_to_i64(b, "integer value")?),
+            ("float", Some(Either5::B(f))) => Value::Float(*f),
+            ("boolean", Some(Either5::D(b))) => Value::Boolean(*b),
+            ("ref", Some(Either5::A(s))) => Value::Ref(parse_uuid(s, "ref value")?),
+            ("keyword", Some(Either5::A(k))) => Value::Keyword(k.clone()),
             ("null", None) => Value::Null,
+            ("set", Some(Either5::E(elements))) => Value::Set(
+                minigraf::ValueSet::new(
+                    elements
+                        .iter()
+                        .map(FactValue::to_core)
+                        .collect::<Result<Vec<_>>>()?,
+                )
+                .map_err(js_err)?,
+            ),
             _ => return Err(mismatch()),
         })
     }
@@ -549,6 +571,9 @@ type PreparedSlot = Mutex<Option<minigraf::PreparedQuery>>;
 /// forms are `FactValue` (`{ type: 'float', value: 2 }` for a float with no
 /// fraction, `'keyword'`, `'ref'`, ...), `{ type: 'entity', value: uuid }`,
 /// `{ type: 'txCount' | 'timestamp', value }` and `{ type: 'anyValidTime' }`.
+/// A set binds as `{ type: 'set', value: [...] }` or a JS `Set` (minigraf#316):
+/// its elements are plain values or typed value forms; an element in another
+/// form is API-017 and a set inside a set API-021.
 /// Anything else is a `TypeError`. Each run reads the database as it is then;
 /// after the database's `close()` every call throws API-018.
 #[napi]
@@ -566,7 +591,7 @@ impl PreparedQuery {
         &self,
         env: Env,
         #[napi(
-            ts_arg_type = "Record<string, boolean | number | bigint | string | null | FactValue | { type: 'entity'; value: string } | { type: 'txCount' | 'timestamp'; value: number | bigint } | { type: 'anyValidTime' }>"
+            ts_arg_type = "Record<string, boolean | number | bigint | string | null | FactValue | Set<boolean | number | bigint | string | null | FactValue> | { type: 'set'; value: Array<boolean | number | bigint | string | null | FactValue> } | { type: 'entity'; value: string } | { type: 'txCount' | 'timestamp'; value: number | bigint } | { type: 'anyValidTime' }>"
         )]
         bindings: Option<Unknown>,
     ) -> Result<String> {
@@ -582,7 +607,7 @@ impl PreparedQuery {
         &self,
         env: Env,
         #[napi(
-            ts_arg_type = "Record<string, boolean | number | bigint | string | null | FactValue | { type: 'entity'; value: string } | { type: 'txCount' | 'timestamp'; value: number | bigint } | { type: 'anyValidTime' }>"
+            ts_arg_type = "Record<string, boolean | number | bigint | string | null | FactValue | Set<boolean | number | bigint | string | null | FactValue> | { type: 'set'; value: Array<boolean | number | bigint | string | null | FactValue> } | { type: 'entity'; value: string } | { type: 'txCount' | 'timestamp'; value: number | bigint } | { type: 'anyValidTime' }>"
         )]
         bindings: Option<Unknown>,
     ) -> Result<Cursor> {
@@ -789,6 +814,24 @@ fn typed_value(
             B::TxCount(u64::try_from(n).map_err(|_| invalid(format!("{what}: {n} is negative")))?)
         }
         "timestamp" => B::Timestamp(integer()?),
+        "set" => match &value {
+            Some(v) if v.is_array()? => {
+                // SAFETY: is_array() said Array.
+                let elements: Vec<Unknown> = unsafe { v.cast() }?;
+                let values = elements
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| match bind_value(&format!("{name}[{i}]"), e)? {
+                        B::Val(v) => Ok(v),
+                        _ => Err(BindError::Napi(invalid(format!(
+                            "{what}: element {i} is not a value"
+                        )))),
+                    })
+                    .collect::<std::result::Result<Vec<_>, BindError>>()?;
+                B::Val(Value::Set(minigraf::ValueSet::new(values).map_err(js_err)?))
+            }
+            _ => return Err(mismatch()),
+        },
         // These two take no value.
         "null" if value.is_none() => B::Val(Value::Null),
         "anyValidTime" if value.is_none() => B::AnyValidTime,
