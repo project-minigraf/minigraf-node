@@ -33,7 +33,8 @@ function setForm(v) {
 
 function bindings(b) {
   if (b === null || typeof b !== 'object' || Array.isArray(b)) return b
-  const out = {}
+  // A null prototype keeps a slot named __proto__ an own property.
+  const out = Object.create(null)
   for (const [name, v] of Object.entries(b)) out[name] = setForm(v)
   return out
 }

@@ -169,3 +169,9 @@ test('bad sets are rejected', () => {
     assert.throws(() => pq.execute({ s: bad }), TypeError)
   }
 })
+
+test('a slot named __proto__ binds', () => {
+  const pq = db().prepare('(query [:find ?x :where [?e :n $__proto__] [?e :n ?x]])')
+  const b = JSON.parse('{"__proto__": 2}')
+  assert.deepEqual(rows(pq.execute(b)), [[2]])
+})
