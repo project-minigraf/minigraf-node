@@ -53,7 +53,8 @@ test('every typed value binds', () => {
     ['(query [:find ?x :where [$v :n ?x]])', { type: 'ref', value: a }],
     ['(query [:find ?x :as-of $v :where [?e :n ?x]])', { type: 'txCount', value: 1 }],
     ['(query [:find ?x :as-of $v :where [?e :n ?x]])', { type: 'txCount', value: 1n }],
-    ['(query [:find ?x :valid-at $v :where [:a :n ?x]])', { type: 'timestamp', value: Date.now() }],
+    // A minute ahead: the fact's valid-from is Rust's clock at transact, which Date.now() can trail.
+    ['(query [:find ?x :valid-at $v :where [:a :n ?x]])', { type: 'timestamp', value: Date.now() + 60_000 }],
     ['(query [:find ?x :valid-at $v :where [:a :n ?x]])', { type: 'anyValidTime' }]
   ]) {
     assert.ok(rows(d.prepare(q).execute({ v })).length > 0, q)
