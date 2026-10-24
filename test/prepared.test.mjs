@@ -114,3 +114,58 @@ test('close() releases prepared queries, so the path reopens', (t) => {
   assert.equal(rows(pq2.execute({ n: 1 })).length, 1)
   again.close()
 })
+
+// ─── Sets (minigraf#316) ─────────────────────────────────────────────────────
+
+test('typed sets and JS Sets bind set values', () => {
+  const pq = db().prepare('(query [:find ?e :where [?e :n ?n] [(in? ?n $s)]])')
+  for (const [s, want] of [
+    [{ type: 'set', value: [1, 3] }, 2],
+    [{ type: 'set', value: [2, 2] }, 1],
+    [new Set([2, 3n]), 2],
+    [{ type: 'set', value: [] }, 0],
+    [new Set(), 0]
+  ]) {
+    assert.equal(rows(pq.execute({ s })).length, want)
+    assert.equal([...pq.query({ s })].length, want, 'query() takes sets too')
+  }
+})
+
+test('set values come back as arrays and in fact records', () => {
+  const d = db()
+  d.execute('(transact [[:a :tags #{1 :k "x"}]])')
+  const equal = d.prepare('(query [:find ?x :where [?e :tags $s] [?e :n ?x]])')
+  const tags = () => [{ type: 'keyword', value: ':k' }, 1, 'x']
+  assert.deepEqual(rows(equal.execute({ s: { type: 'set', value: tags() } })), [[1]])
+  assert.deepEqual(rows(equal.execute({ s: new Set(tags()) })), [[1]])
+  assert.deepEqual(rows(equal.execute({ s: new Set([':k', 1, 'x']) })), [], 'a string is no keyword')
+  assert.deepEqual(rows(d.execute('(query [:find ?t :where [:a :tags ?t]])')), [[['x', 1, ':k']]])
+  const [record] = [...d.factLog({ attributes: [':tags'] })]
+  assert.deepEqual(record.value, {
+    type: 'set',
+    value: [{ type: 'string', value: 'x' }, { type: 'integer', value: 1n }, { type: 'keyword', value: ':k' }]
+  })
+})
+
+test('bad sets are rejected', () => {
+  const d = db()
+  const pq = d.prepare('(query [:find ?e :where [?e :n ?n] [(in? ?n $s)]])')
+  for (const nested of [
+    { type: 'set', value: [{ type: 'set', value: [1] }] },
+    new Set([new Set([1])]),
+    { type: 'set', value: [new Set()] }
+  ]) {
+    throwsCode(() => pq.execute({ s: nested }), 'API-021')
+  }
+  for (const bad of [
+    { type: 'set', value: [{ type: 'entity', value: entityA(d) }] },
+    { type: 'set', value: [{ type: 'anyValidTime' }] },
+    { type: 'set', value: 1 },
+    { type: 'set' }
+  ]) {
+    throwsCode(() => pq.execute({ s: bad }), 'API-017')
+  }
+  for (const bad of [[1], { type: 'set', value: [undefined] }, { type: 'set', value: [{}] }, { type: 'set', value: [[1]] }]) {
+    assert.throws(() => pq.execute({ s: bad }), TypeError)
+  }
+})

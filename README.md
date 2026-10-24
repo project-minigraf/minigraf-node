@@ -123,6 +123,14 @@ value: 5 }` or `{ type: 'timestamp', value: Date.now() }` for `:as-of`; and
 slot throws `[API-022]`, a slot in an attribute position `[API-023]`, and a value of the
 wrong kind `[API-024]`.
 
+A set binds as a JS `Set` or `{ type: 'set', value: [...] }`, for `in?` and the other set
+predicates or a set-valued attribute: `pq.execute({ ids: new Set([1, 2, 3]) })`. Its
+elements are plain values or typed value forms (`{ type: 'keyword', value: ':role/admin' }`).
+An element in an entity, tx count, timestamp or any-valid-time form throws `[API-017]`, a
+set inside a set `[API-021]`; a plain array is not a set (`TypeError`). Set values come
+back as JSON arrays from `execute()` and as `{ type: 'set', value: [FactValue, ...] }` in
+fact records.
+
 `db.close()` also releases every prepared query made from it, so the path can be opened
 again; a prepared query used after that throws `[API-018] database is closed`.
 

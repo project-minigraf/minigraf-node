@@ -19,6 +19,13 @@ for (const name of ['Alice', 'Bob']) assert.deepEqual(names(pq.execute({ name })
 assert.deepEqual(names(pq.execute({ name: { type: 'string', value: 'Alice' } })), ['Alice'])
 console.log('ok: prepared query runs with plain and typed bind values')
 
+mem.execute('(transact [[:alice :tags #{1 "x"}]])')
+const tags = JSON.parse(mem.execute('(query [:find ?t :where [?e :tags ?t]])')).results
+assert.deepEqual(tags, [[['x', 1]]], 'a set value comes back as an array')
+const member = mem.prepare('(query [:find ?t :where [?e :tags ?t] [(in? 1 $s)]])')
+assert.deepEqual(JSON.parse(member.execute({ s: new Set([1, 2]) })).results, [[['x', 1]]], 'a set binds')
+console.log('ok: set values come back and bind')
+
 assert.throws(() => mem.execute('(query [:find'), (e) => e instanceof Error && e.message.length > 0)
 console.log('ok: invalid Datalog throws')
 

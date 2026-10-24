@@ -204,3 +204,22 @@ test('queryMemoryLimit throws QRY-012 (#549)', (t) => {
 
   throwsCode(() => MiniGrafDb.openWithOptions(p('neg.graph'), { queryMemoryLimit: -1 }), 'API-017')
 })
+
+test('log writer copies set values (minigraf#316)', (t) => {
+  const p = tmpDir(t)
+  const src = MiniGrafDb.inMemory()
+  src.execute('(transact [[:a :tags #{1 :k "x"}] [:b :tags #{}]])')
+  const records = [...src.factLog()]
+  const out = p('sets.graph')
+  const w = LogWriter.create(out)
+  w.appendBatch(records)
+  w.finish()
+  const copy = MiniGrafDb.openWithOptions(out, { readOnly: true })
+  assert.deepEqual([...copy.factLog()], records)
+  copy.close()
+
+  const bad = LogWriter.create(p('nested.graph'))
+  const nested = { ...records[0], value: { type: 'set', value: [{ type: 'set', value: [] }] } }
+  assert.throws(() => bad.append(nested), (e) => e.message.startsWith('[API-021]'))
+  bad.close()
+})
