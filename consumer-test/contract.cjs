@@ -13,6 +13,12 @@ mem.execute('(transact [[:alice :name "Alice"]])')
 assert.deepEqual(names(mem.execute(QUERY)), ['Alice'])
 console.log('ok: in memory')
 
+mem.execute('(transact [[:bob :name "Bob"]])')
+const pq = mem.prepare('(query [:find ?n :where [?e :name $name] [?e :name ?n]])')
+for (const name of ['Alice', 'Bob']) assert.deepEqual(names(pq.execute({ name })), [name])
+assert.deepEqual(names(pq.execute({ name: { type: 'string', value: 'Alice' } })), ['Alice'])
+console.log('ok: prepared query runs with plain and typed bind values')
+
 assert.throws(() => mem.execute('(query [:find'), (e) => e instanceof Error && e.message.length > 0)
 console.log('ok: invalid Datalog throws')
 

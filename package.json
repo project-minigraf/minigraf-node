@@ -26,7 +26,7 @@
   },
   "scripts": {
     "build": "napi build --platform --release --no-js",
-    "test": "node --test test/basic.test.mjs test/etl.test.mjs"
+    "test": "node --test test/basic.test.mjs test/etl.test.mjs test/prepared.test.mjs"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3"
