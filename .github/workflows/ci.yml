@@ -46,8 +46,14 @@ jobs:
       - name: Build native addon
         run: npx napi build --platform --release --no-js
 
+      # The Rust tests call no Node-API function, so they link without Node;
+      # Linux only, where the test binary may leave napi symbols unresolved.
+      - name: Run Rust tests
+        if: runner.os == 'Linux'
+        run: cargo test
+
       - name: Run tests
-        run: node --test test/basic.test.mjs test/etl.test.mjs test/prepared.test.mjs
+        run: node --test test/basic.test.mjs test/etl.test.mjs test/prepared.test.mjs test/udf.test.mjs
 
   # Builds the five npm tarballs as the release publishes them, including the
   # universal macOS binary.
