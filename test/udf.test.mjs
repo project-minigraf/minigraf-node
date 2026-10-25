@@ -98,6 +98,13 @@ test('a throw fails the query with QRY-014', () => {
   throwsMessage(() => d.execute(q('boom?')), '[QRY-014] user function `boom?` failed: bad 1')
   throwsMessage(() => d.execute(q('str?')), '[QRY-014] user function `str?` failed: plain')
   throwsMessage(() => d.execute(q('num?')), '[QRY-014] user function `num?` failed: returned number, not a boolean')
+  // A thrown value whose message cannot be read, and one String() cannot convert.
+  d.registerPredicate('getter?', () => { throw { get message () { throw new Error('getter') } } }) // eslint-disable-line no-throw-literal
+  d.registerPredicate('symbol?', () => { throw Symbol('s') }) // eslint-disable-line no-throw-literal
+  d.registerPredicate('opaque?', () => { throw Object.create(null) }) // eslint-disable-line no-throw-literal
+  throwsMessage(() => d.execute(q('getter?')), '[QRY-014] user function `getter?` failed: [object Object]')
+  throwsMessage(() => d.execute(q('symbol?')), '[QRY-014] user function `symbol?` failed: Symbol(s)')
+  throwsMessage(() => d.execute(q('opaque?')), '[QRY-014] user function `opaque?` failed: user function failed')
 
   // Through a cursor, a prepared query and a prepared cursor too.
   const cursor = d.query(q('boom?'))
@@ -119,6 +126,7 @@ test('aggregate failures fail the query', () => {
     ['bad-finish', { ...ok, finish: bad }, 'no'],
     ['bad-ref', { ...ok, finish: () => ({ type: 'ref', value: 'nope' }) }, 'invalid argument: finish\'s result of type "ref" "nope" is not a UUID'],
     ['bad-entity', { ...ok, finish: () => ({ type: 'entity', value: '00000000-0000-0000-0000-000000000000' }) }, "invalid argument: finish's result is not a value"],
+    ['bad-getter', { ...ok, finish: () => ({ get type () { throw new Error('getter') } }) }, 'getter'],
     ['bad-object', { ...ok, finish: () => ({}) }, "finish's result: a bind value is a boolean, number, bigint, string, null or {type, value} object"]
   ]) {
     d.registerAggregate(name, agg)

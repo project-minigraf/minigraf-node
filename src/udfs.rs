@@ -198,13 +198,33 @@ impl Scope {
             napi_ok(sys::napi_get_undefined(self.env, &mut this))?;
             sys::napi_call_function(self.env, this, f, args.len(), args.as_ptr(), &mut result)
         };
-        if status == sys::Status::napi_pending_exception {
-            let mut e = ptr::null_mut();
-            napi_ok(unsafe { sys::napi_get_and_clear_last_exception(self.env, &mut e) })?;
-            return Err(UdfError::new(strip_code(&self.thrown(e))));
+        if let Some(message) = self.take_exception() {
+            return Err(UdfError::new(strip_code(&message)));
         }
         napi_ok(status)?;
         Ok(result)
+    }
+
+    /// Clear a pending exception, returning its message. A call that leaves
+    /// one pending fails every later Node-API call of the query.
+    fn take_exception(&self) -> Option<String> {
+        let mut pending = false;
+        let mut e = ptr::null_mut();
+        unsafe {
+            if sys::napi_is_exception_pending(self.env, &mut pending) != sys::Status::napi_ok
+                || !pending
+                || sys::napi_get_and_clear_last_exception(self.env, &mut e) != sys::Status::napi_ok
+            {
+                return None;
+            }
+        }
+        Some(self.thrown(e))
+    }
+
+    /// Clear a pending exception, if any.
+    fn clear_exception(&self) {
+        let mut ignored = ptr::null_mut();
+        unsafe { sys::napi_get_and_clear_last_exception(self.env, &mut ignored) };
     }
 
     /// What a function threw, as a message: its `message` when it has a
@@ -226,9 +246,10 @@ impl Scope {
                 _ => Ok(None),
             }
         };
-        message()
-            .ok()
-            .flatten()
+        // A throwing `message` getter leaves its exception pending.
+        let message = message().ok().flatten();
+        self.clear_exception();
+        message
             .or_else(|| self.string(e.raw()))
             .unwrap_or_else(|| "user function failed".to_string())
     }
@@ -236,6 +257,12 @@ impl Scope {
     /// `String(v)`, which converts any value, as `napi_coerce_to_string`
     /// does not for a `Symbol`.
     fn string(&self, v: sys::napi_value) -> Option<String> {
+        let string = self.string_inner(v);
+        self.clear_exception();
+        string
+    }
+
+    fn string_inner(&self, v: sys::napi_value) -> Option<String> {
         let env = Env::from_raw(self.env);
         let string: Function<Unknown, String> =
             env.get_global().ok()?.get_named_property("String").ok()?;
@@ -247,8 +274,6 @@ impl Scope {
             }
             let status = sys::napi_call_function(self.env, this, string.raw(), 1, &v, &mut result);
             if status != sys::Status::napi_ok {
-                let mut ignored = ptr::null_mut();
-                sys::napi_get_and_clear_last_exception(self.env, &mut ignored);
                 return None;
             }
             String::from_napi_value(self.env, result).ok()
@@ -355,7 +380,12 @@ pub(crate) fn finish(
     let scope = Scope::open()?;
     let args = [scope.get(acc)?, scope.number(count)?];
     let result = scope.unknown(scope.call(finish, &args)?);
-    match bind_value("finish's result", &result) {
+    let value = bind_value("finish's result", &result);
+    // A throwing getter on the result leaves its exception pending.
+    if let (Err(_), Some(message)) = (&value, scope.take_exception()) {
+        return Err(UdfError::new(strip_code(&message)));
+    }
+    match value {
         Ok(minigraf::BindValue::Val(v)) => Ok(v),
         Ok(_) => Err(UdfError::new(strip_code(
             &invalid("finish's result is not a value".into()).reason,
