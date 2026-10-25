@@ -26,6 +26,16 @@ const member = mem.prepare('(query [:find ?t :where [?e :tags ?t] [(in? 1 $s)]])
 assert.deepEqual(JSON.parse(member.execute({ s: new Set([1, 2]) })).results, [[['x', 1]]], 'a set binds')
 console.log('ok: set values come back and bind')
 
+mem.execute('(transact [[:alice :age 30] [:bob :age 12]])')
+mem.registerPredicate('adult?', (v) => v.type === 'integer' && v.value >= 18n)
+assert.deepEqual(names(mem.execute('(query [:find ?n :where [?e :age ?a] [(adult? ?a)] [?e :name ?n]])')), ['Alice'])
+mem.registerAggregate('product', { init: () => 1n, step: (acc, v) => acc * v.value, finish: (acc) => acc })
+assert.deepEqual(JSON.parse(mem.execute('(query [:find (product ?a) :where [?e :age ?a]])')).results, [[360]])
+mem.registerPredicate('boom?', () => { throw new Error('no') })
+assert.throws(() => mem.execute('(query [:find ?a :where [?e :age ?a] [(boom? ?a)]])'),
+  (e) => e.message === '[QRY-014] user function `boom?` failed: no')
+console.log('ok: user functions run, and a throw is QRY-014')
+
 assert.throws(() => mem.execute('(query [:find'), (e) => e instanceof Error && e.message.length > 0)
 console.log('ok: invalid Datalog throws')
 

@@ -134,6 +134,52 @@ fact records.
 `db.close()` also releases every prepared query made from it, so the path can be opened
 again; a prepared query used after that throws `[API-018] database is closed`.
 
+## User functions
+
+`db.registerPredicate(name, fn)` adds a predicate, called in a query as `[(name ?v)]`.
+`db.registerAggregate(name, { init, step, finish })` adds an aggregate, used in `:find`
+as `(name ?v)` and as a window function with `:over`: `init()` returns a new
+accumulator (one per group or window partition), `step(acc, value)` returns the
+accumulator after `value`, and `finish(acc, count)` returns the result, `count` being
+the number of values stepped. All are called as plain functions, with no `this`.
+
+```js
+db.registerPredicate('adult?', (v) => v.type === 'integer' && v.value >= 18n)
+db.registerAggregate('product', {
+  init: () => 1n,
+  step: (acc, v) => acc * v.value,
+  finish: (acc) => acc,
+})
+db.execute('(query [:find ?n :where [?e :age ?a] [(adult? ?a)] [?e :name ?n]])')
+db.execute('(query [:find (product ?a) :where [?e :age ?a]])')
+```
+
+- **Values.** A function receives each value as a `FactValue`, `{ type, value }`, as in
+  fact records: `type` is `'string'`, `'integer'` (`value` a `bigint`), `'float'`,
+  `'boolean'`, `'ref'` (an entity UUID string), `'keyword'`, `'null'` (no `value`) or
+  `'set'` (`value` an array of these). A predicate returns a boolean. An accumulator may
+  be any value. `finish` returns a value in any form a prepared query's bindings accept:
+  a plain value or a typed `{ type, value }` form.
+- **Errors.** A function that throws fails the query with `[QRY-014]`, carrying the
+  error's `message` (else `String(e)`), and so does a predicate that returns anything
+  but a boolean, or a `finish` whose result is not a value. It is never read as `false`
+  or a missing value. Registration throws a `TypeError` when a function is missing, and
+  `[INT-040]` when the name is taken (predicates and aggregates have separate names).
+- **Lifecycle.** A query that is already open (a cursor) does not see a function
+  registered after it; every query opened afterwards does. The database keeps each
+  function until it, and every cursor and prepared query opened from it, are released.
+  There is no unregister.
+- **Threading.** A function runs on the JavaScript thread that calls `execute`,
+  `nextBatch` or a prepared query, which is the thread that registered it. A database
+  opened in a worker thread keeps its functions in that worker.
+- **Cost.** Each value is one call into JavaScript, so a function over many rows costs
+  one call per value.
+- **Calling the database from a function.** A function may query the same database
+  (`execute`, `query`, `prepare` and the prepared query's `execute`/`query`), write,
+  checkpoint, register another function, or `close()` it. The query that called it does
+  not see a write it makes, and keeps running after a `close()`. A function that calls
+  `nextBatch()` on the cursor whose batch called it fails its call.
+
 ## Building from source
 
 Requires Rust stable toolchain and `@napi-rs/cli`.

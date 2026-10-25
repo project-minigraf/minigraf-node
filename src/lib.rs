@@ -1,8 +1,12 @@
 use minigraf::{MinigrafError, QueryResult, Value};
 use napi::bindgen_prelude::*;
+use napi::{JsValue, sys};
 use napi_derive::napi;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
+
+mod udfs;
 
 fn js_err(e: MinigrafError) -> Error {
     Error::new(Status::GenericFailure, e.to_string())
@@ -420,11 +424,8 @@ impl MiniGrafDb {
     /// Open a cursor over a `(query ...)`. Its answer is fixed when it opens.
     #[napi]
     pub fn query(&self, datalog: String) -> Result<Cursor> {
-        let cursor = self.with_db(|db| db.query(&datalog))?;
-        Ok(Cursor {
-            vars: cursor.vars().to_vec(),
-            inner: Some(cursor),
-        })
+        let cursor = self.db()?.query(&datalog).map_err(js_err)?;
+        Ok(Cursor::new(cursor))
     }
 
     /// Stream every fact record that `filter` keeps. Checkpoints wait until
@@ -432,7 +433,7 @@ impl MiniGrafDb {
     #[napi]
     pub fn fact_log(&self, filter: Option<FactFilter>) -> Result<FactLog> {
         let filter = filter.unwrap_or_default().to_core()?;
-        let log = self.with_db(|db| db.fact_log(&filter))?;
+        let log = self.db()?.fact_log(&filter).map_err(js_err)?;
         Ok(FactLog { inner: Some(log) })
     }
 
@@ -442,13 +443,14 @@ impl MiniGrafDb {
     /// position.
     #[napi]
     pub fn prepare(&self, datalog: String) -> Result<PreparedQuery> {
-        // Holding `inner` until the slot is listed: a `close()` cannot run in
-        // between and miss it.
+        let query = Arc::new(self.db()?.prepare(&datalog).map_err(js_err)?);
+        // Listed under `inner`, so a `close()` either ran before (and the
+        // query is dropped) or runs after and empties the slot.
         let guard = self.inner.lock().map_err(|_| poisoned())?;
-        let db = guard
-            .as_ref()
-            .ok_or_else(|| Error::new(Status::GenericFailure, CLOSED_MSG))?;
-        let slot = Arc::new(Mutex::new(Some(db.prepare(&datalog).map_err(js_err)?)));
+        if guard.is_none() {
+            return Err(Error::new(Status::GenericFailure, CLOSED_MSG));
+        }
+        let slot = Arc::new(Mutex::new(Some(query)));
         let mut prepared = self.prepared.lock().map_err(|_| poisoned())?;
         prepared.retain(|w| w.strong_count() > 0);
         prepared.push(Arc::downgrade(&slot));
@@ -458,36 +460,105 @@ impl MiniGrafDb {
     /// The transaction counter that `:as-of N` compares against.
     #[napi]
     pub fn current_tx_count(&self) -> Result<BigInt> {
-        Ok(BigInt::from(self.with_db(|db| Ok(db.current_tx_count()))?))
+        Ok(BigInt::from(self.db()?.current_tx_count()))
     }
 
     /// Execute a Datalog string. Returns a JSON string. Throws on error.
     #[napi]
     pub fn execute(&self, datalog: String) -> Result<String> {
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|_| Error::new(Status::GenericFailure, "mutex poisoned"))?;
-        let result = guard
-            .as_ref()
-            .ok_or_else(|| Error::new(Status::GenericFailure, CLOSED_MSG))?
-            .execute(&datalog)
-            .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
+        let result = self.db()?.execute(&datalog).map_err(js_err)?;
         Ok(query_result_to_json(result))
     }
 
     /// Flush the WAL to disk. Throws on error.
     #[napi]
     pub fn checkpoint(&self) -> Result<()> {
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|_| Error::new(Status::GenericFailure, "mutex poisoned"))?;
-        guard
-            .as_ref()
-            .ok_or_else(|| Error::new(Status::GenericFailure, CLOSED_MSG))?
-            .checkpoint()
-            .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))
+        self.db()?.checkpoint().map_err(js_err)
+    }
+
+    /// Register `predicate` under `name`, called in a query as
+    /// `[(name ?v)]`. It receives a `FactValue` and returns a boolean.
+    ///
+    /// ```js
+    /// db.registerPredicate('adult?', (v) => v.type === 'integer' && v.value >= 18n)
+    /// ```
+    ///
+    /// A throw, or a result that is not a boolean, fails the query with
+    /// QRY-014. A query already open does not see the function; every query
+    /// opened afterwards does. Throws a `TypeError` when `predicate` is not a
+    /// function, and INT-040 when `name` is taken.
+    #[napi]
+    pub fn register_predicate(
+        &self,
+        env: Env,
+        name: String,
+        #[napi(ts_arg_type = "(value: FactValue) => boolean")] predicate: Unknown,
+    ) -> Result<()> {
+        let f = function(&env, &predicate, "the predicate")?;
+        let db = self.db()?;
+        let f = udfs::hold(&env, f)?;
+        db.try_register_predicate(&name, move |v| udfs::test(&f, v))
+            .map_err(js_err)
+    }
+
+    /// Register an aggregate under `name`, used in `:find` as `(name ?v)`
+    /// and as a window function with `:over`. `init()` returns a new
+    /// accumulator (one per group or window partition), `step(acc, value)`
+    /// returns the accumulator after `value`, and `finish(acc, count)`
+    /// returns the result, `count` being the number of values stepped. They
+    /// are called as plain functions, with no `this`. The result is a plain
+    /// value or a typed form, as a prepared query's bind value.
+    ///
+    /// ```js
+    /// db.registerAggregate('product', {
+    ///   init: () => 1n,
+    ///   step: (acc, v) => acc * v.value,
+    ///   finish: (acc) => acc,
+    /// })
+    /// ```
+    ///
+    /// A throw fails the query with QRY-014. Throws a `TypeError` when
+    /// `init`, `step` or `finish` is not a function, and INT-040 when `name`
+    /// is taken.
+    #[napi]
+    pub fn register_aggregate(
+        &self,
+        env: Env,
+        name: String,
+        #[napi(
+            ts_arg_type = "{ init: () => unknown; step: (acc: any, value: FactValue) => unknown; finish: (acc: any, count: number) => boolean | number | bigint | string | null | FactValue }"
+        )]
+        aggregate: Unknown,
+    ) -> Result<()> {
+        let member = |key: &str| -> Result<sys::napi_value> {
+            let f = match aggregate.get_type()? {
+                ValueType::Object => {
+                    // SAFETY: get_type() said Object.
+                    let object: Object = unsafe { aggregate.cast() }?;
+                    object.get::<Unknown>(key)?
+                }
+                _ => None,
+            };
+            let what = format!("the aggregate's {key}");
+            match f {
+                Some(f) => function(&env, &f, &what),
+                None => Err(type_error(&env, &format!("{what} must be a function"))),
+            }
+        };
+        let (init, step, finish) = (member("init")?, member("step")?, member("finish")?);
+        let db = self.db()?;
+        let (init, step, finish) = (
+            udfs::hold(&env, init)?,
+            udfs::hold(&env, step)?,
+            udfs::hold(&env, finish)?,
+        );
+        db.try_register_aggregate(
+            &name,
+            move || udfs::init(&init),
+            move |acc: &mut udfs::Held, v| udfs::step(&step, acc, v),
+            move |acc, count| udfs::finish(&finish, acc, count),
+        )
+        .map_err(js_err)
     }
 
     /// Close the database, releasing its file lock immediately.
@@ -540,18 +611,31 @@ impl MiniGrafDb {
 }
 
 impl MiniGrafDb {
-    fn with_db<T>(
-        &self,
-        f: impl FnOnce(&minigraf::Minigraf) -> std::result::Result<T, MinigrafError>,
-    ) -> Result<T> {
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|_| Error::new(Status::GenericFailure, "mutex poisoned"))?;
-        let db = guard
-            .as_ref()
-            .ok_or_else(|| Error::new(Status::GenericFailure, CLOSED_MSG))?;
-        f(db).map_err(js_err)
+    /// The database, cloned out of the handle so that no binding lock is
+    /// held while the core runs: a user function may call back into this
+    /// handle, even `close()` it. A call already running keeps its clone.
+    fn db(&self) -> Result<minigraf::Minigraf> {
+        let guard = self.inner.lock().map_err(|_| poisoned())?;
+        guard
+            .clone()
+            .ok_or_else(|| Error::new(Status::GenericFailure, CLOSED_MSG))
+    }
+}
+
+/// `f` as a function's raw value, or a `TypeError` naming `what`.
+fn function(env: &Env, f: &Unknown, what: &str) -> Result<sys::napi_value> {
+    if f.get_type()? == ValueType::Function {
+        Ok(f.raw())
+    } else {
+        Err(type_error(env, &format!("{what} must be a function")))
+    }
+}
+
+/// Throw a `TypeError`, returning the error that tells napi it is pending.
+fn type_error(env: &Env, msg: &str) -> Error {
+    match env.throw_type_error(msg, None) {
+        Ok(()) => Error::new(Status::PendingException, msg),
+        Err(e) => e,
     }
 }
 
@@ -561,8 +645,9 @@ fn poisoned() -> Error {
 
 // ─── Prepared queries ────────────────────────────────────────────────────────
 
-/// A prepared query, `None` once its database is closed.
-type PreparedSlot = Mutex<Option<minigraf::PreparedQuery>>;
+/// A prepared query, `None` once its database is closed. Shared, so that a
+/// run holds no lock: a user function may run the same query again.
+type PreparedSlot = Mutex<Option<Arc<minigraf::PreparedQuery>>>;
 
 /// A query parsed once by `MiniGrafDb.prepare`, run with bind values.
 ///
@@ -613,10 +698,7 @@ impl PreparedQuery {
     ) -> Result<Cursor> {
         let binds = read_bindings(&env, bindings)?;
         let cursor = self.with_query(|q| q.query(&as_slice(&binds)))?;
-        Ok(Cursor {
-            vars: cursor.vars().to_vec(),
-            inner: Some(cursor),
-        })
+        Ok(Cursor::new(cursor))
     }
 }
 
@@ -625,11 +707,13 @@ impl PreparedQuery {
         &self,
         f: impl FnOnce(&minigraf::PreparedQuery) -> std::result::Result<T, MinigrafError>,
     ) -> Result<T> {
-        let guard = self.slot.lock().map_err(|_| poisoned())?;
-        let q = guard
-            .as_ref()
+        let q = self
+            .slot
+            .lock()
+            .map_err(|_| poisoned())?
+            .clone()
             .ok_or_else(|| js_err(MinigrafError::closed("database")))?;
-        f(q).map_err(js_err)
+        f(&q).map_err(js_err)
     }
 }
 
@@ -657,11 +741,7 @@ fn read_bindings(
 ) -> Result<Vec<(String, minigraf::BindValue)>> {
     read_bindings_inner(bindings).map_err(|e| match e {
         BindError::Napi(e) => e,
-        BindError::Type(msg) => match env.throw_type_error(&msg, None) {
-            // The TypeError is pending; this status tells napi not to replace it.
-            Ok(()) => Error::new(Status::PendingException, msg),
-            Err(e) => e,
-        },
+        BindError::Type(msg) => type_error(env, &msg),
     })
 }
 
@@ -689,13 +769,14 @@ fn read_bindings_inner(
             let v = values
                 .get(&name)
                 .ok_or_else(|| BindError::Type(format!("slot ${name} has no value")))?;
-            let bind = bind_value(&name, v)?;
+            let bind = bind_value(&format!("slot ${name}"), v)?;
             Ok((name, bind))
         })
         .collect()
 }
 
-fn bind_value(name: &str, v: &Unknown) -> std::result::Result<minigraf::BindValue, BindError> {
+/// `v` as a bind value; `what` names it in errors, such as `slot $name`.
+fn bind_value(what: &str, v: &Unknown) -> std::result::Result<minigraf::BindValue, BindError> {
     use minigraf::BindValue as B;
     // SAFETY: each cast follows the get_type() it matches.
     Ok(match v.get_type()? {
@@ -704,12 +785,12 @@ fn bind_value(name: &str, v: &Unknown) -> std::result::Result<minigraf::BindValu
         ValueType::String => B::Val(Value::String(unsafe { v.cast::<String>() }?)),
         ValueType::BigInt => B::Val(Value::Integer(bigint_to_i64(
             &unsafe { v.cast::<BigInt>() }?,
-            &format!("slot ${name}"),
+            what,
         )?)),
         ValueType::Number => {
             let f = unsafe { v.cast::<f64>() }?;
             if is_integer(f) {
-                B::Val(Value::Integer(number_to_i64(f, &format!("slot ${name}"))?))
+                B::Val(Value::Integer(number_to_i64(f, what)?))
             } else {
                 B::Val(Value::Float(f))
             }
@@ -723,18 +804,18 @@ fn bind_value(name: &str, v: &Unknown) -> std::result::Result<minigraf::BindValu
                 }
                 _ => None,
             };
-            match kind.and_then(|k| typed_value(name, &k, &object).transpose()) {
+            match kind.and_then(|k| typed_value(what, &k, &object).transpose()) {
                 Some(bind) => bind?,
-                None => return Err(not_a_bind_value(name)),
+                None => return Err(not_a_bind_value(what)),
             }
         }
-        _ => return Err(not_a_bind_value(name)),
+        _ => return Err(not_a_bind_value(what)),
     })
 }
 
-fn not_a_bind_value(name: &str) -> BindError {
+fn not_a_bind_value(what: &str) -> BindError {
     BindError::Type(format!(
-        "slot ${name}: a bind value is a boolean, number, bigint, string, null or {{type, value}} object"
+        "{what}: a bind value is a boolean, number, bigint, string, null or {{type, value}} object"
     ))
 }
 
@@ -757,12 +838,13 @@ fn number_to_i64(f: f64, what: &str) -> Result<i64> {
 
 /// A typed `{ type, value }` form, or `None` if `kind` names no type.
 fn typed_value(
-    name: &str,
+    what: &str,
     kind: &str,
     object: &Object,
 ) -> std::result::Result<Option<minigraf::BindValue>, BindError> {
     use minigraf::BindValue as B;
-    let what = format!("slot ${name} of type {kind:?}");
+    let element = |i: usize| format!("{what}[{i}]");
+    let what = format!("{what} of type {kind:?}");
     let mismatch = || {
         BindError::Napi(invalid(format!(
             "{what}: the value does not match the type"
@@ -821,7 +903,7 @@ fn typed_value(
                 let values = elements
                     .iter()
                     .enumerate()
-                    .map(|(i, e)| match bind_value(&format!("{name}[{i}]"), e)? {
+                    .map(|(i, e)| match bind_value(&element(i), e)? {
                         B::Val(v) => Ok(v),
                         _ => Err(BindError::Napi(invalid(format!(
                             "{what}: element {i} is not a value"
@@ -846,8 +928,21 @@ fn typed_value(
 #[napi]
 pub struct Cursor {
     vars: Vec<String>,
-    /// `None` after `close()` or the end.
-    inner: Option<minigraf::Cursor>,
+    /// `None` after `close()` or the end. Borrowed while a batch is read,
+    /// which may call a user function that reads this cursor again.
+    inner: RefCell<Option<minigraf::Cursor>>,
+    /// Set by a `close()` made while a batch is read; the read then drops it.
+    closed: Cell<bool>,
+}
+
+impl Cursor {
+    fn new(cursor: minigraf::Cursor) -> Self {
+        Cursor {
+            vars: cursor.vars().to_vec(),
+            inner: RefCell::new(Some(cursor)),
+            closed: Cell::new(false),
+        }
+    }
 }
 
 #[napi]
@@ -861,15 +956,32 @@ impl Cursor {
     /// The next batch of at most `maxRows` rows (0 counts as 1), as a JSON
     /// array of rows encoded like `execute()`'s `results`; `null` at the end
     /// or after `close()`. A batch is never empty.
+    ///
+    /// A user function that calls `nextBatch()` on the cursor reading the
+    /// batch it is called for fails its call.
     #[napi]
-    pub fn next_batch(&mut self, max_rows: u32) -> Result<Option<String>> {
-        let Some(cursor) = self.inner.as_mut() else {
+    pub fn next_batch(&self, max_rows: u32) -> Result<Option<String>> {
+        if self.closed.get() {
+            return Ok(None);
+        }
+        let mut inner = self.inner.try_borrow_mut().map_err(|_| {
+            Error::new(
+                Status::GenericFailure,
+                "the cursor is already reading a batch",
+            )
+        })?;
+        let Some(cursor) = inner.as_mut() else {
             return Ok(None);
         };
-        match cursor.next_batch(max_rows as usize).map_err(js_err)? {
+        let batch = cursor.next_batch(max_rows as usize);
+        if self.closed.get() {
+            *inner = None;
+            return Ok(None);
+        }
+        match batch.map_err(js_err)? {
             Some(batch) => Ok(Some(rows_to_json(batch.rows()))),
             None => {
-                self.inner = None;
+                *inner = None;
                 Ok(None)
             }
         }
@@ -877,8 +989,12 @@ impl Cursor {
 
     /// Release the cursor. Later `nextBatch()` calls return `null`.
     #[napi]
-    pub fn close(&mut self) {
-        self.inner = None;
+    pub fn close(&self) {
+        self.closed.set(true);
+        // While a batch is read, the read releases it when it returns.
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            *inner = None;
+        }
     }
 }
 

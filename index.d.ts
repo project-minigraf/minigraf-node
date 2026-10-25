@@ -9,6 +9,8 @@ export declare class Cursor {
    * The next batch of at most `maxRows` rows (0 counts as 1), as a JSON
    * array of rows encoded like `execute()`'s `results`; `null` at the end
    * or after `close()`. A batch is never empty.
+   * A user function that calls `nextBatch()` on the cursor reading the
+   * batch it is called for fails its call.
    */
   nextBatch(maxRows: number): string | null
   /** Release the cursor. Later `nextBatch()` calls return `null`. */
@@ -101,6 +103,42 @@ export declare class MiniGrafDb {
   execute(datalog: string): string
   /** Flush the WAL to disk. Throws on error. */
   checkpoint(): void
+  /**
+   * Register `predicate` under `name`, called in a query as
+   * `[(name ?v)]`. It receives a `FactValue` and returns a boolean.
+   *
+   * ```js
+   * db.registerPredicate('adult?', (v) => v.type === 'integer' && v.value >= 18n)
+   * ```
+   *
+   * A throw, or a result that is not a boolean, fails the query with
+   * QRY-014. A query already open does not see the function; every query
+   * opened afterwards does. Throws a `TypeError` when `predicate` is not a
+   * function, and INT-040 when `name` is taken.
+   */
+  registerPredicate(name: string, predicate: (value: FactValue) => boolean): void
+  /**
+   * Register an aggregate under `name`, used in `:find` as `(name ?v)`
+   * and as a window function with `:over`. `init()` returns a new
+   * accumulator (one per group or window partition), `step(acc, value)`
+   * returns the accumulator after `value`, and `finish(acc, count)`
+   * returns the result, `count` being the number of values stepped. They
+   * are called as plain functions, with no `this`. The result is a plain
+   * value or a typed form, as a prepared query's bind value.
+   *
+   * ```js
+   * db.registerAggregate('product', {
+   *   init: () => 1n,
+   *   step: (acc, v) => acc * v.value,
+   *   finish: (acc) => acc,
+   * })
+   * ```
+   *
+   * A throw fails the query with QRY-014. Throws a `TypeError` when
+   * `init`, `step` or `finish` is not a function, and INT-040 when `name`
+   * is taken.
+   */
+  registerAggregate(name: string, aggregate: { init: () => unknown; step: (acc: any, value: FactValue) => unknown; finish: (acc: any, count: number) => boolean | number | bigint | string | null | FactValue }): void
   /**
    * Close the database, releasing its file lock immediately.
    *
