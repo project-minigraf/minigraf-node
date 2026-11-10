@@ -198,6 +198,27 @@ export declare class PreparedQuery {
    * answer is fixed when the cursor opens.
    */
   query(bindings?: Record<string, boolean | number | bigint | string | null | FactValue | Set<boolean | number | bigint | string | null | FactValue> | { type: 'set'; value: Array<boolean | number | bigint | string | null | FactValue> } | { type: 'entity'; value: string } | { type: 'txCount' | 'timestamp'; value: number | bigint } | { type: 'anyValidTime' }>): Cursor
+  /**
+   * A new prepared query that may derive at most `n` facts; this one is
+   * unchanged. An allowed `:max-derived-facts` or `:max-results` in the
+   * query still overrides it. 2^53 - 1 (`Number.MAX_SAFE_INTEGER`) or more
+   * means no limit; negative is API-017. Not gated by `allowOverrides`.
+   * The database's `close()` closes it too (API-018 after).
+   */
+  withMaxDerivedFacts(n: number): PreparedQuery
+  /**
+   * A new prepared query that may hold at most `bytes` bytes (QRY-012
+   * beyond); this one is unchanged. `0` lets only queries that hold no
+   * state run. Takes its argument as `withMaxDerivedFacts` does.
+   */
+  withQueryMemoryLimit(bytes: number): PreparedQuery
+  /**
+   * A new prepared query whose rule strata may run at most `n` rounds
+   * (INT-020 beyond); this one is unchanged. An allowed `:max-iterations`
+   * in the query still overrides it. Takes its argument as
+   * `withMaxDerivedFacts` does.
+   */
+  withMaxIterations(n: number): PreparedQuery
 }
 
 /**
@@ -277,4 +298,28 @@ export interface OpenOptions {
    * also means no limit.
    */
   queryMemoryLimit?: number
+  /**
+   * The query keywords query text may use to override these settings.
+   * Absent: `OVERRIDABLE_DEFAULTS`. A list replaces the defaults; an empty
+   * one refuses every override keyword (API-025). An unknown name is
+   * API-017.
+   */
+  allowOverrides?: Array<'maxDerivedFacts' | 'maxResults' | 'queryMemoryLimit' | 'maxIterations'>
+  /**
+   * Facts one transaction stages before a file database writes them in
+   * chunks. Default 65,536; clamped to 1..=1,000,000.
+   */
+  transactionChunkFacts?: number
+  /**
+   * Rounds one stratum of a rule query may run; more throw INT-020.
+   * Default 1,000,000; 2^53 - 1 (`Number.MAX_SAFE_INTEGER`) or more means
+   * no limit.
+   */
+  maxIterations?: number
 }
+
+/**
+ * The override list that applies when `allowOverrides` is absent: the
+ * Rust `Overridable::DEFAULTS`. Exported as `OVERRIDABLE_DEFAULTS`.
+ */
+export declare function overridableDefaults(): Array<'maxDerivedFacts' | 'maxResults' | 'queryMemoryLimit' | 'maxIterations'>

@@ -87,7 +87,7 @@ try {
 
 Options: `readOnly`, `pageCacheSize`, `allowUnlocked`, `walCheckpointThreshold`,
 `maxDerivedFacts`, `maxResults`, `synchronous` (`'full'` or `'normal'`),
-`queryMemoryLimit`. Fact filter:
+`queryMemoryLimit`, `allowOverrides`, `transactionChunkFacts`, `maxIterations`. Fact filter:
 `attributes`, `attributePrefixes`, `entities` (UUID strings), `txFrom`/`txTo`
 (inclusive, bigint), `order` (`'tx'` or `'storage'`), `window`.
 
@@ -102,6 +102,28 @@ that keep state (join build sides, negation and `or` tables, distinct sets, aggr
 groups, window rows, rule-derived facts). A query that would hold more throws QRY-012 and
 frees what it held. The default, and `Number.MAX_SAFE_INTEGER` or more, is no limit. Rows
 a cursor returns are not counted, so read a large answer with `query()`.
+
+Query text may override some settings with keywords such as `:max-derived-facts 1000`.
+`allowOverrides` lists the keywords it may use, by name: `'maxDerivedFacts'`,
+`'maxResults'`, `'queryMemoryLimit'`, `'maxIterations'`. Left out, the defaults apply:
+`OVERRIDABLE_DEFAULTS`, read from the core library (today `'maxDerivedFacts'`,
+`'maxResults'` and `'maxIterations'`). A list replaces the defaults, it does not add to
+them, and `[]` refuses every keyword: a query that uses one throws `[API-025]` from
+`execute()`, `query()` and `prepare()`. An unknown name throws `[API-017]` when the
+database opens, as a bad `synchronous` value does.
+
+```js
+const { MiniGrafDb, OVERRIDABLE_DEFAULTS } = require('minigraf')
+const db = MiniGrafDb.openWithOptions('app.graph', {
+  allowOverrides: [...OVERRIDABLE_DEFAULTS, 'queryMemoryLimit'],
+  maxIterations: 10000,          // rounds per stratum of a rule query, else INT-020
+  transactionChunkFacts: 16384,  // facts staged before a large transaction is chunked
+})
+```
+
+`maxIterations` defaults to 1,000,000, and `Number.MAX_SAFE_INTEGER` or more is no
+limit; `transactionChunkFacts` defaults to 65,536 and is clamped to 1..=1,000,000. A
+negative count throws `[API-017]`.
 
 ## Prepared queries
 
@@ -131,7 +153,19 @@ set inside a set `[API-021]`; a plain array is not a set (`TypeError`). Set valu
 back as JSON arrays from `execute()` and as `{ type: 'set', value: [FactValue, ...] }` in
 fact records.
 
-`db.close()` also releases every prepared query made from it, so the path can be opened
+`withMaxDerivedFacts(n)`, `withQueryMemoryLimit(bytes)` and `withMaxIterations(n)` each
+return a new `PreparedQuery` with that limit; the one they are called on is unchanged.
+They are application code, so `allowOverrides` does not apply to them, and an allowed
+keyword in the query text still overrides them. `Number.MAX_SAFE_INTEGER` or more means
+no limit and a negative value throws `[API-017]`.
+
+```js
+const reach = db.prepare('(query [:find ?x ?y :where (reach ?x ?y)])')
+const small = reach.withMaxDerivedFacts(10000).withQueryMemoryLimit(16 * 1024 * 1024)
+small.execute() // [INT-020] or [QRY-012] past a limit; reach is unchanged
+```
+
+`db.close()` also releases every prepared query made from it, derived ones included, so the path can be opened
 again; a prepared query used after that throws `[API-018] database is closed`.
 
 ## User functions

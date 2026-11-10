@@ -59,3 +59,8 @@ module.exports.VALID_TIME_FOREVER = 9223372036854775807n
  * none when the handle closes. Call `checkpoint()` yourself.
  */
 module.exports.WAL_CHECKPOINT_NEVER = Number.MAX_SAFE_INTEGER
+/**
+ * The override list that applies when `allowOverrides` is absent: the Rust
+ * `Overridable::DEFAULTS`, read from the core library (minigraf#872).
+ */
+module.exports.OVERRIDABLE_DEFAULTS = Object.freeze(binding.overridableDefaults())

@@ -3,7 +3,7 @@
 // Datalog. Usage: node contract.cjs <empty directory>
 const assert = require('node:assert/strict')
 const path = require('node:path')
-const { MiniGrafDb } = require('minigraf')
+const { MiniGrafDb, OVERRIDABLE_DEFAULTS } = require('minigraf')
 
 const QUERY = '(query [:find ?n :where [?e :name ?n]])'
 const names = (json) => JSON.parse(json).results.map((row) => row[0])
@@ -48,3 +48,24 @@ const again = new MiniGrafDb(file)
 assert.deepEqual(names(again.execute(QUERY)), ['Bob'])
 again.close()
 console.log('ok: file-backed survives reopen')
+
+// minigraf#872: the override list, the new open options and a prepared setter.
+assert.deepEqual([...OVERRIDABLE_DEFAULTS], ['maxDerivedFacts', 'maxResults', 'maxIterations'])
+const limited = MiniGrafDb.openWithOptions(path.join(process.argv[2], 'overrides.graph'), {
+  allowOverrides: [],
+  transactionChunkFacts: 2,
+  maxIterations: 1000,
+})
+limited.execute('(transact [[:a :edge :b] [:b :edge :c] [:c :edge :d]])')
+limited.execute('(rule [(reach ?x ?y) [?x :edge ?y]])')
+limited.execute('(rule [(reach ?x ?y) [?x :edge ?z] (reach ?z ?y)])')
+assert.throws(() => limited.execute('(query [:find ?x ?y :where (reach ?x ?y) :max-derived-facts 10])'),
+  (e) => e.message.startsWith('[API-025]'))
+const reach = limited.prepare('(query [:find ?x ?y :where (reach ?x ?y)])')
+const derived = reach.withMaxIterations(1)
+assert.throws(() => derived.execute(), (e) => e.message.startsWith('[INT-020]'))
+assert.equal(JSON.parse(reach.execute()).results.length, 6, 'the receiver is unchanged')
+limited.close()
+assert.throws(() => derived.execute(), (e) => e.message.startsWith('[API-018]'))
+console.log('ok: override list, open options and a prepared setter')
+

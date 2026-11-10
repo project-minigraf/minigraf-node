@@ -20,6 +20,16 @@ fn to_usize(n: i64, what: &str) -> Result<usize> {
     usize::try_from(n).map_err(|_| invalid(format!("{what} {n} is out of range")))
 }
 
+/// A limit: from `Number.MAX_SAFE_INTEGER` up, core's `usize::MAX` (no
+/// limit), which a JS number cannot hold; a negative count is API-017.
+fn to_limit(n: i64, what: &str) -> Result<usize> {
+    if n >= MAX_SAFE_INTEGER {
+        Ok(usize::MAX)
+    } else {
+        to_usize(n, what)
+    }
+}
+
 fn bigint_to_i64(b: &BigInt, what: &str) -> Result<i64> {
     let (n, lossless) = b.get_i64();
     if lossless {
@@ -127,6 +137,42 @@ pub struct OpenOptions {
     /// QRY-012. Default no limit; 2^53 - 1 (`Number.MAX_SAFE_INTEGER`) or more
     /// also means no limit.
     pub query_memory_limit: Option<i64>,
+    /// The query keywords query text may use to override these settings.
+    /// Absent: `OVERRIDABLE_DEFAULTS`. A list replaces the defaults; an empty
+    /// one refuses every override keyword (API-025). An unknown name is
+    /// API-017.
+    #[napi(
+        ts_type = "Array<'maxDerivedFacts' | 'maxResults' | 'queryMemoryLimit' | 'maxIterations'>"
+    )]
+    pub allow_overrides: Option<Vec<String>>,
+    /// Facts one transaction stages before a file database writes them in
+    /// chunks. Default 65,536; clamped to 1..=1,000,000.
+    pub transaction_chunk_facts: Option<i64>,
+    /// Rounds one stratum of a rule query may run; more throw INT-020.
+    /// Default 1,000,000; 2^53 - 1 (`Number.MAX_SAFE_INTEGER`) or more means
+    /// no limit.
+    pub max_iterations: Option<i64>,
+}
+
+/// The names of `OpenOptions.allowOverrides`, in core's order.
+const OVERRIDABLE: [(minigraf::Overridable, &str); 4] = [
+    (minigraf::Overridable::MaxDerivedFacts, "maxDerivedFacts"),
+    (minigraf::Overridable::MaxResults, "maxResults"),
+    (minigraf::Overridable::QueryMemoryLimit, "queryMemoryLimit"),
+    (minigraf::Overridable::MaxIterations, "maxIterations"),
+];
+
+/// The override list that applies when `allowOverrides` is absent: the
+/// Rust `Overridable::DEFAULTS`. Exported as `OVERRIDABLE_DEFAULTS`.
+#[napi(
+    ts_return_type = "Array<'maxDerivedFacts' | 'maxResults' | 'queryMemoryLimit' | 'maxIterations'>"
+)]
+pub fn overridable_defaults() -> Vec<String> {
+    minigraf::Overridable::DEFAULTS
+        .iter()
+        .filter_map(|d| OVERRIDABLE.iter().find(|(o, _)| o == d))
+        .map(|(_, name)| (*name).to_string())
+        .collect()
 }
 
 impl OpenOptions {
@@ -169,6 +215,27 @@ impl OpenOptions {
                 to_usize(v, "queryMemoryLimit")?
             };
             o = o.query_memory_limit(n);
+        }
+        if let Some(names) = &self.allow_overrides {
+            let mut list = Vec::with_capacity(names.len());
+            for name in names {
+                match OVERRIDABLE.iter().find(|(_, n)| n == name) {
+                    Some((o, _)) => list.push(*o),
+                    None => {
+                        return Err(invalid(format!(
+                            "allowOverrides {name:?} is not 'maxDerivedFacts', 'maxResults', \
+                             'queryMemoryLimit' or 'maxIterations'"
+                        )));
+                    }
+                }
+            }
+            o = o.allow_overrides(list);
+        }
+        if let Some(v) = self.transaction_chunk_facts {
+            o = o.transaction_chunk_facts(to_usize(v, "transactionChunkFacts")?);
+        }
+        if let Some(v) = self.max_iterations {
+            o = o.max_iterations(to_limit(v, "maxIterations")?);
         }
         match self.synchronous.as_deref() {
             None => {}
@@ -376,7 +443,34 @@ pub struct MiniGrafDb {
     inner: Arc<Mutex<Option<minigraf::Minigraf>>>,
     /// Every prepared query made from this handle, emptied by `close()` so
     /// that none keeps the file open.
-    prepared: Mutex<Vec<Weak<PreparedSlot>>>,
+    prepared: Arc<Registry>,
+}
+
+/// The prepared queries of one handle, by weak reference.
+type Registry = Mutex<Vec<Weak<PreparedSlot>>>;
+
+/// List `query` under `db`'s handle and return it, or `closed()` if the
+/// handle is closed. Done under the handle's lock, so a `close()` either ran
+/// before (and the query is dropped) or runs after and empties the slot.
+fn register(
+    db: &Arc<Mutex<Option<minigraf::Minigraf>>>,
+    registry: &Arc<Registry>,
+    query: Arc<minigraf::PreparedQuery>,
+    closed: impl FnOnce() -> Error,
+) -> Result<PreparedQuery> {
+    let guard = db.lock().map_err(|_| poisoned())?;
+    if guard.is_none() {
+        return Err(closed());
+    }
+    let slot = Arc::new(Mutex::new(Some(query)));
+    let mut prepared = registry.lock().map_err(|_| poisoned())?;
+    prepared.retain(|w| w.strong_count() > 0);
+    prepared.push(Arc::downgrade(&slot));
+    Ok(PreparedQuery {
+        slot,
+        db: db.clone(),
+        registry: registry.clone(),
+    })
 }
 
 #[napi]
@@ -391,7 +485,7 @@ impl MiniGrafDb {
             .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
         Ok(Self {
             inner: Arc::new(Mutex::new(Some(db))),
-            prepared: Mutex::default(),
+            prepared: Arc::default(),
         })
     }
 
@@ -402,7 +496,7 @@ impl MiniGrafDb {
             .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
         Ok(Self {
             inner: Arc::new(Mutex::new(Some(db))),
-            prepared: Mutex::default(),
+            prepared: Arc::default(),
         })
     }
 
@@ -417,7 +511,7 @@ impl MiniGrafDb {
             .map_err(js_err)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(Some(db))),
-            prepared: Mutex::default(),
+            prepared: Arc::default(),
         })
     }
 
@@ -444,17 +538,9 @@ impl MiniGrafDb {
     #[napi]
     pub fn prepare(&self, datalog: String) -> Result<PreparedQuery> {
         let query = Arc::new(self.db()?.prepare(&datalog).map_err(js_err)?);
-        // Listed under `inner`, so a `close()` either ran before (and the
-        // query is dropped) or runs after and empties the slot.
-        let guard = self.inner.lock().map_err(|_| poisoned())?;
-        if guard.is_none() {
-            return Err(Error::new(Status::GenericFailure, CLOSED_MSG));
-        }
-        let slot = Arc::new(Mutex::new(Some(query)));
-        let mut prepared = self.prepared.lock().map_err(|_| poisoned())?;
-        prepared.retain(|w| w.strong_count() > 0);
-        prepared.push(Arc::downgrade(&slot));
-        Ok(PreparedQuery { slot })
+        register(&self.inner, &self.prepared, query, || {
+            Error::new(Status::GenericFailure, CLOSED_MSG)
+        })
     }
 
     /// The transaction counter that `:as-of N` compares against.
@@ -664,6 +750,9 @@ type PreparedSlot = Mutex<Option<Arc<minigraf::PreparedQuery>>>;
 #[napi]
 pub struct PreparedQuery {
     slot: Arc<PreparedSlot>,
+    /// The handle and its registry, for the queries the setters derive.
+    db: Arc<Mutex<Option<minigraf::Minigraf>>>,
+    registry: Arc<Registry>,
 }
 
 #[napi]
@@ -700,9 +789,50 @@ impl PreparedQuery {
         let cursor = self.with_query(|q| q.query(&as_slice(&binds)))?;
         Ok(Cursor::new(cursor))
     }
+
+    /// A new prepared query that may derive at most `n` facts; this one is
+    /// unchanged. An allowed `:max-derived-facts` or `:max-results` in the
+    /// query still overrides it. 2^53 - 1 (`Number.MAX_SAFE_INTEGER`) or more
+    /// means no limit; negative is API-017. Not gated by `allowOverrides`.
+    /// The database's `close()` closes it too (API-018 after).
+    #[napi]
+    pub fn with_max_derived_facts(&self, n: i64) -> Result<PreparedQuery> {
+        let n = to_limit(n, "maxDerivedFacts")?;
+        self.derive(|q| q.with_max_derived_facts(n))
+    }
+
+    /// A new prepared query that may hold at most `bytes` bytes (QRY-012
+    /// beyond); this one is unchanged. `0` lets only queries that hold no
+    /// state run. Takes its argument as `withMaxDerivedFacts` does.
+    #[napi]
+    pub fn with_query_memory_limit(&self, bytes: i64) -> Result<PreparedQuery> {
+        let bytes = to_limit(bytes, "queryMemoryLimit")?;
+        self.derive(|q| q.with_query_memory_limit(bytes))
+    }
+
+    /// A new prepared query whose rule strata may run at most `n` rounds
+    /// (INT-020 beyond); this one is unchanged. An allowed `:max-iterations`
+    /// in the query still overrides it. Takes its argument as
+    /// `withMaxDerivedFacts` does.
+    #[napi]
+    pub fn with_max_iterations(&self, n: i64) -> Result<PreparedQuery> {
+        let n = to_limit(n, "maxIterations")?;
+        self.derive(|q| q.with_max_iterations(n))
+    }
 }
 
 impl PreparedQuery {
+    /// A copy with `set` applied, listed under the same handle.
+    fn derive(
+        &self,
+        set: impl FnOnce(minigraf::PreparedQuery) -> minigraf::PreparedQuery,
+    ) -> Result<PreparedQuery> {
+        let q = self.with_query(|q| Ok(q.clone()))?;
+        register(&self.db, &self.registry, Arc::new(set(q)), || {
+            js_err(MinigrafError::closed("database"))
+        })
+    }
+
     fn with_query<T>(
         &self,
         f: impl FnOnce(&minigraf::PreparedQuery) -> std::result::Result<T, MinigrafError>,
