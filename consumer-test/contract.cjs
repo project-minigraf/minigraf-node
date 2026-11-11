@@ -69,3 +69,28 @@ limited.close()
 assert.throws(() => derived.execute(), (e) => e.message.startsWith('[API-018]'))
 console.log('ok: override list, open options and a prepared setter')
 
+
+// minigraf#824: write transactions through the installed package.
+const txFile = path.join(process.argv[2], 'tx.graph')
+const txDb = new MiniGrafDb(txFile)
+txDb.execute('(transact [[:alice :name "Alice"]])')
+const tx = txDb.beginWrite({ chunkFacts: 1000 })
+tx.execute('(transact [[:bob :name "Bob"]])')
+assert.deepEqual(names(tx.execute(QUERY)).sort(), ['Alice', 'Bob'], 'the transaction reads its own write')
+tx.commit()
+const rolledBack = txDb.beginWrite()
+try {
+  rolledBack.execute('(transact [[:carol :name "Carol"]])')
+  throw new Error('leave the block')
+} catch (e) {
+  assert.equal(e.message, 'leave the block')
+} finally {
+  rolledBack.rollback()
+}
+assert.deepEqual(names(txDb.execute(QUERY)).sort(), ['Alice', 'Bob'], 'the rollback discards')
+assert.throws(() => tx.execute(QUERY), (e) => e.message.startsWith('[API-018]'), 'a finished transaction')
+txDb.close()
+const txAgain = new MiniGrafDb(txFile)
+assert.deepEqual(names(txAgain.execute(QUERY)).sort(), ['Alice', 'Bob'], 'the commit survives reopen')
+txAgain.close()
+console.log('ok: write transactions commit, roll back and survive reopen')

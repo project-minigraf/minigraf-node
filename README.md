@@ -214,6 +214,48 @@ db.execute('(query [:find (product ?a) :where [?e :age ?a]])')
   not see a write it makes, and keeps running after a `close()`. A function that calls
   `nextBatch()` on the cursor whose batch called it fails its call.
 
+## Write transactions
+
+A write transaction stages several `transact`, `retract` and `query` statements, with
+queries seeing what it staged, and then commits them as one transaction or rolls them
+back (minigraf#824). First in the release built on core v3.0.0 (core commit
+`CORE_COMMIT`).
+
+```js
+const db = new MiniGrafDb('bank.graph')
+db.execute('(transact [[:alice :balance 100] [:bob :balance 50]])')
+
+const tx = db.beginWrite({ chunkFacts: 10000 })
+try {
+  tx.execute('(transact [[:alice :balance 70] [:bob :balance 80]])')
+  tx.execute('(retract [[:alice :balance 100] [:bob :balance 50]])')
+  const [[balance]] = JSON.parse(tx.execute('(query [:find ?b :where [:alice :balance ?b]])')).results
+  if (balance >= 0) tx.commit()
+} finally {
+  tx.rollback() // does nothing once committed
+}
+```
+
+- `db.beginWrite(options?)`: `{ synchronous?: 'full' | 'normal', chunkFacts?: number }`,
+  an absent option being the database's. `synchronous` is this commit's WAL sync,
+  `chunkFacts` the facts staged before a file database writes the transaction in chunks
+  (negative or an unknown `synchronous` is API-017). Read-only databases throw API-014.
+- `tx.execute(datalog)` returns what `db.execute` returns; a staged write returns
+  `{"ok":true}`. A statement that throws stages nothing and leaves the transaction open.
+  There are no cursors or prepared queries inside a transaction.
+- `tx.commit()` applies everything as one transaction; a commit that throws rolls back.
+  `tx.rollback()` discards it. Either way it is finished (`tx.isOpen` is false):
+  `execute` and `commit` then throw API-018, and `rollback` does nothing.
+- Commit is always explicit, and the garbage collector may never free an abandoned
+  transaction, which keeps the write lock: end every one, in a `finally`.
+- There is one JavaScript thread, so while a transaction is open every other call on
+  its database that reads or writes (`execute`, `query`, `factLog`, `prepare`,
+  `checkpoint`, another `beginWrite`, prepared queries) throws INT-001; nothing waits.
+  A user function its statements run gets INT-001 too, also when it calls the
+  transaction itself.
+- `db.close()` rolls back an open transaction and finishes it (API-018 afterwards).
+- Rules registered inside a transaction stay registered after a rollback.
+
 ## Building from source
 
 Requires Rust stable toolchain and `@napi-rs/cli`.
