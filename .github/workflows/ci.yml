@@ -53,7 +53,7 @@ jobs:
         run: cargo test
 
       - name: Run tests
-        run: node --test test/basic.test.mjs test/etl.test.mjs test/prepared.test.mjs test/udf.test.mjs
+        run: node --test test/basic.test.mjs test/etl.test.mjs test/prepared.test.mjs test/udf.test.mjs test/overrides.test.mjs test/transactions.test.mjs
 
   # Builds the five npm tarballs as the release publishes them, including the
   # universal macOS binary.
