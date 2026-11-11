@@ -444,7 +444,13 @@ pub struct MiniGrafDb {
     /// Every prepared query made from this handle, emptied by `close()` so
     /// that none keeps the file open.
     prepared: Arc<Registry>,
+    /// Every write transaction begun on this handle, rolled back by
+    /// `close()` (minigraf#824).
+    transactions: Arc<TxRegistry>,
 }
+
+/// The write transactions of one handle, by weak reference.
+type TxRegistry = Mutex<Vec<Weak<TxSlot>>>;
 
 /// The prepared queries of one handle, by weak reference.
 type Registry = Mutex<Vec<Weak<PreparedSlot>>>;
@@ -486,6 +492,7 @@ impl MiniGrafDb {
         Ok(Self {
             inner: Arc::new(Mutex::new(Some(db))),
             prepared: Arc::default(),
+            transactions: Arc::default(),
         })
     }
 
@@ -497,6 +504,7 @@ impl MiniGrafDb {
         Ok(Self {
             inner: Arc::new(Mutex::new(Some(db))),
             prepared: Arc::default(),
+            transactions: Arc::default(),
         })
     }
 
@@ -512,6 +520,7 @@ impl MiniGrafDb {
         Ok(Self {
             inner: Arc::new(Mutex::new(Some(db))),
             prepared: Arc::default(),
+            transactions: Arc::default(),
         })
     }
 
@@ -547,6 +556,44 @@ impl MiniGrafDb {
     #[napi]
     pub fn current_tx_count(&self) -> Result<BigInt> {
         Ok(BigInt::from(self.db()?.current_tx_count()))
+    }
+
+    /// Begin a write transaction (minigraf#824). `options.synchronous`
+    /// (`'full'` or `'normal'`) and `options.chunkFacts` apply to this
+    /// transaction only; absent, they are the database's.
+    ///
+    /// ```js
+    /// const tx = db.beginWrite()
+    /// try {
+    ///   tx.execute('(transact [[:alice :balance 90]])')
+    ///   tx.commit()
+    /// } finally {
+    ///   tx.rollback() // does nothing once committed
+    /// }
+    /// ```
+    ///
+    /// While it is open, every other call on this database that reads or
+    /// writes (`execute`, `query`, `factLog`, `prepare`, `checkpoint`,
+    /// another `beginWrite`, a prepared query's runs) throws INT-001: there
+    /// is one JavaScript thread, so nothing ever waits. Throws API-014 on a
+    /// read-only database and API-017 for a negative `chunkFacts`.
+    #[napi]
+    pub fn begin_write(&self, options: Option<TxOptions>) -> Result<WriteTransaction> {
+        let options = options.unwrap_or_default().to_core()?;
+        let tx = self.db()?.begin_write_owned_with(options).map_err(js_err)?;
+        // Listed under the handle's lock, as prepared queries are: a close()
+        // either ran before (and the transaction is rolled back here) or
+        // runs after and finds it.
+        let guard = self.inner.lock().map_err(|_| poisoned())?;
+        if guard.is_none() {
+            tx.rollback();
+            return Err(Error::new(Status::GenericFailure, CLOSED_MSG));
+        }
+        let slot = Arc::new(Mutex::new(Some(tx)));
+        let mut transactions = self.transactions.lock().map_err(|_| poisoned())?;
+        transactions.retain(|w| w.strong_count() > 0);
+        transactions.push(Arc::downgrade(&slot));
+        Ok(WriteTransaction { slot })
     }
 
     /// Execute a Datalog string. Returns a JSON string. Throws on error.
@@ -681,6 +728,16 @@ impl MiniGrafDb {
             .inner
             .lock()
             .map_err(|_| Error::new(Status::GenericFailure, "mutex poisoned"))?;
+        // An open transaction holds the write lock and the file: roll it
+        // back, and finish it (API-018 from then on).
+        let transactions = std::mem::take(&mut *self.transactions.lock().map_err(|_| poisoned())?);
+        for slot in transactions.iter().filter_map(Weak::upgrade) {
+            if let Ok(mut tx) = slot.lock()
+                && let Some(tx) = tx.take()
+            {
+                tx.rollback();
+            }
+        }
         // A prepared query holds the file open too (core's PreparedQuery
         // keeps the storage), so release every one first.
         let prepared = std::mem::take(&mut *self.prepared.lock().map_err(|_| poisoned())?);
@@ -727,6 +784,118 @@ fn type_error(env: &Env, msg: &str) -> Error {
 
 fn poisoned() -> Error {
     Error::new(Status::GenericFailure, "mutex poisoned")
+}
+
+// ─── Write transactions (minigraf#824) ───────────────────────────────────────
+
+/// Options for `MiniGrafDb.beginWrite`. Every field is optional; an absent
+/// field is the database's value.
+#[napi(object)]
+#[derive(Default)]
+pub struct TxOptions {
+    /// This transaction's WAL durability: `"full"` or `"normal"`.
+    #[napi(ts_type = "'full' | 'normal'")]
+    pub synchronous: Option<String>,
+    /// Facts this transaction stages before a file database writes them in
+    /// chunks. Clamped to 1..=1,000,000; negative throws API-017.
+    pub chunk_facts: Option<i64>,
+}
+
+impl TxOptions {
+    fn to_core(&self) -> Result<minigraf::TxOptions> {
+        let mut o = minigraf::TxOptions::new();
+        match self.synchronous.as_deref() {
+            None => {}
+            Some("full") => o = o.synchronous(minigraf::SyncMode::Full),
+            Some("normal") => o = o.synchronous(minigraf::SyncMode::Normal),
+            Some(other) => {
+                return Err(invalid(format!(
+                    "synchronous {other:?} is not 'full' or 'normal'"
+                )));
+            }
+        }
+        if let Some(v) = self.chunk_facts {
+            o = o.chunk_facts(to_usize(v, "chunkFacts")?);
+        }
+        Ok(o)
+    }
+}
+
+/// An open transaction, `None` once finished.
+type TxSlot = Mutex<Option<minigraf::OwnedWriteTransaction>>;
+
+/// A write transaction from `MiniGrafDb.beginWrite`.
+///
+/// `execute` runs one statement inside it: a `transact`/`retract` is staged
+/// and returns `{"ok":true}`, a `query` reads the committed facts plus the
+/// staged ones, and a `rule` is registered at once (a rollback keeps it). A
+/// statement that throws stages nothing and leaves the transaction open.
+/// `commit()` applies everything as one transaction; `rollback()` discards it.
+///
+/// After a commit (successful or not), a rollback, or the database's
+/// `close()`, it is finished: `execute` and `commit` throw API-018, and
+/// `rollback` does nothing. JavaScript's collector may never free an
+/// abandoned one, which keeps the write lock: always end it, in a `finally`.
+#[napi]
+pub struct WriteTransaction {
+    slot: Arc<TxSlot>,
+}
+
+#[napi]
+impl WriteTransaction {
+    /// Run one Datalog command inside the transaction. Returns the JSON
+    /// `MiniGrafDb.execute` returns for the same core result.
+    #[napi]
+    pub fn execute(&self, datalog: String) -> Result<String> {
+        let mut guard = self.lock()?;
+        let tx = guard.as_mut().ok_or_else(tx_finished)?;
+        Ok(query_result_to_json(tx.execute(&datalog).map_err(js_err)?))
+    }
+
+    /// Commit every staged change as one transaction. A commit that throws
+    /// rolls the transaction back; either way it is finished.
+    #[napi]
+    pub fn commit(&self) -> Result<()> {
+        let tx = self.lock()?.take().ok_or_else(tx_finished)?;
+        tx.commit().map_err(js_err)
+    }
+
+    /// Discard every staged change. Does nothing on a finished transaction.
+    #[napi]
+    pub fn rollback(&self) -> Result<()> {
+        if let Some(tx) = self.lock()?.take() {
+            tx.rollback();
+        }
+        Ok(())
+    }
+
+    /// Whether the transaction is still open.
+    #[napi(getter)]
+    pub fn is_open(&self) -> bool {
+        self.slot.lock().is_ok_and(|g| g.is_some())
+    }
+}
+
+impl WriteTransaction {
+    /// The slot. Only the JavaScript thread calls in, so a slot already held
+    /// means a user function called the transaction from inside one of its
+    /// own statements, which would deadlock: refuse it instead.
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Option<minigraf::OwnedWriteTransaction>>> {
+        match self.slot.try_lock() {
+            Ok(guard) => Ok(guard),
+            Err(std::sync::TryLockError::WouldBlock) => Err(Error::new(
+                Status::GenericFailure,
+                "[INT-001] a write transaction is already in progress on this thread; \
+                 a user function cannot call the transaction it runs in",
+            )),
+            Err(std::sync::TryLockError::Poisoned(_)) => Err(poisoned()),
+        }
+    }
+}
+
+/// API-018: a call on a finished transaction.
+fn tx_finished() -> Error {
+    js_err(MinigrafError::closed("write transaction"))
 }
 
 // ─── Prepared queries ────────────────────────────────────────────────────────

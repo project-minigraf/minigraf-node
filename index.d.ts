@@ -99,6 +99,28 @@ export declare class MiniGrafDb {
   prepare(datalog: string): PreparedQuery
   /** The transaction counter that `:as-of N` compares against. */
   currentTxCount(): bigint
+  /**
+   * Begin a write transaction (minigraf#824). `options.synchronous`
+   * (`'full'` or `'normal'`) and `options.chunkFacts` apply to this
+   * transaction only; absent, they are the database's.
+   *
+   * ```js
+   * const tx = db.beginWrite()
+   * try {
+   *   tx.execute('(transact [[:alice :balance 90]])')
+   *   tx.commit()
+   * } finally {
+   *   tx.rollback() // does nothing once committed
+   * }
+   * ```
+   *
+   * While it is open, every other call on this database that reads or
+   * writes (`execute`, `query`, `factLog`, `prepare`, `checkpoint`,
+   * another `beginWrite`, a prepared query's runs) throws INT-001: there
+   * is one JavaScript thread, so nothing ever waits. Throws API-014 on a
+   * read-only database and API-017 for a negative `chunkFacts`.
+   */
+  beginWrite(options?: TxOptions | undefined | null): WriteTransaction
   /** Execute a Datalog string. Returns a JSON string. Throws on error. */
   execute(datalog: string): string
   /** Flush the WAL to disk. Throws on error. */
@@ -222,6 +244,37 @@ export declare class PreparedQuery {
 }
 
 /**
+ * A write transaction from `MiniGrafDb.beginWrite`.
+ *
+ * `execute` runs one statement inside it: a `transact`/`retract` is staged
+ * and returns `{"ok":true}`, a `query` reads the committed facts plus the
+ * staged ones, and a `rule` is registered at once (a rollback keeps it). A
+ * statement that throws stages nothing and leaves the transaction open.
+ * `commit()` applies everything as one transaction; `rollback()` discards it.
+ *
+ * After a commit (successful or not), a rollback, or the database's
+ * `close()`, it is finished: `execute` and `commit` throw API-018, and
+ * `rollback` does nothing. JavaScript's collector may never free an
+ * abandoned one, which keeps the write lock: always end it, in a `finally`.
+ */
+export declare class WriteTransaction {
+  /**
+   * Run one Datalog command inside the transaction. Returns the JSON
+   * `MiniGrafDb.execute` returns for the same core result.
+   */
+  execute(datalog: string): string
+  /**
+   * Commit every staged change as one transaction. A commit that throws
+   * rolls the transaction back; either way it is finished.
+   */
+  commit(): void
+  /** Discard every staged change. Does nothing on a finished transaction. */
+  rollback(): void
+  /** Whether the transaction is still open. */
+  get isOpen(): boolean
+}
+
+/**
  * Which records a fact log returns. Every field is optional; the ones that
  * are set must all match.
  */
@@ -323,3 +376,17 @@ export interface OpenOptions {
  * Rust `Overridable::DEFAULTS`. Exported as `OVERRIDABLE_DEFAULTS`.
  */
 export declare function overridableDefaults(): Array<'maxDerivedFacts' | 'maxResults' | 'queryMemoryLimit' | 'maxIterations'>
+
+/**
+ * Options for `MiniGrafDb.beginWrite`. Every field is optional; an absent
+ * field is the database's value.
+ */
+export interface TxOptions {
+  /** This transaction's WAL durability: `"full"` or `"normal"`. */
+  synchronous?: 'full' | 'normal'
+  /**
+   * Facts this transaction stages before a file database writes them in
+   * chunks. Clamped to 1..=1,000,000; negative throws API-017.
+   */
+  chunkFacts?: number
+}
