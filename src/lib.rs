@@ -1422,3 +1422,57 @@ impl LogWriter {
         self.inner.is_some()
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod transaction_tests {
+    use super::*;
+
+    const NAMES: &str = "(query [:find ?n :where [?e :person/name ?n]])";
+
+    fn names(db: &MiniGrafDb) -> String {
+        db.execute(NAMES.into()).expect("query")
+    }
+
+    /// Dropping the last reference to an open transaction (what napi's
+    /// finalizer does) rolls it back and frees the write lock (minigraf#824).
+    #[test]
+    fn dropped_transaction_rolls_back_and_frees_the_lock() {
+        let db = MiniGrafDb::in_memory().expect("open");
+        db.execute(r#"(transact [[:alice :person/name "Alice"]])"#.into())
+            .expect("setup");
+        let tx = db.begin_write(None).expect("begin");
+        tx.execute(r#"(transact [[:bob :person/name "Bob"]])"#.into())
+            .expect("stage");
+        drop(tx);
+        assert!(
+            !names(&db).contains("Bob"),
+            "the dropped transaction rolled back"
+        );
+        db.execute(r#"(transact [[:carol :person/name "Carol"]])"#.into())
+            .expect("the write lock is free");
+        let tx = db.begin_write(None).expect("a new begin works");
+        tx.rollback().expect("rollback");
+    }
+
+    /// A transaction dropped after `close()` was already finished by it; the
+    /// drop does nothing, and the file reopens.
+    #[test]
+    fn dropped_after_close_is_harmless() {
+        let dir = std::env::temp_dir().join(format!("minigraf_node_tx_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("g.graph").to_str().expect("utf-8").to_string();
+        let db = MiniGrafDb::new(path.clone()).expect("open");
+        let tx = db.begin_write(None).expect("begin");
+        tx.execute(r#"(transact [[:bob :person/name "Bob"]])"#.into())
+            .expect("stage");
+        db.close().expect("close");
+        assert!(!tx.is_open(), "close finished it");
+        drop(tx);
+        let again = MiniGrafDb::new(path).expect("reopen");
+        assert!(!names(&again).contains("Bob"), "nothing of the transaction");
+        again.close().expect("close");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
